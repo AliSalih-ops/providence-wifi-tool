@@ -199,6 +199,14 @@ def enable_monitor(iface: Interface, kill_networkmanager: bool = False,
             _warn_weak_driver(iface.driver, log)
         return mon
 
+    # If the interface vanished, the adapter reset/disconnected — don't thrash.
+    if not any(i.name == iface.name for i in _parse_iw_dev(_iw_dev())):
+        if log:
+            log(f"'{iface.name}' is gone — the adapter reset/disconnected (common with VM USB "
+                "passthrough when switching to monitor mode). Replug it, then click Refresh. "
+                "The realtek-rtl8188eus-dkms driver + a USB 2.0 VM controller are far more stable.")
+        return None
+
     # Fallback: manual switch on the original interface name.
     if log:
         log("airmon-ng did not produce a monitor interface; trying manual iw method.")
@@ -209,7 +217,8 @@ def enable_monitor(iface: Interface, kill_networkmanager: bool = False,
     if mon and log:
         log(f"Monitor mode enabled (manual): {mon}")
     elif log:
-        log("Failed to enable monitor mode. Check the driver and that you're root.")
+        log("Failed to enable monitor mode. If the adapter keeps dropping, it's the USB "
+            "passthrough resetting it — see the driver/USB notes.")
     return mon
 
 
