@@ -29,7 +29,8 @@ from .capture import (
     pmkid_detection_available,
 )
 from .iface import (
-    Interface, current_mac, disable_monitor, enable_monitor, list_interfaces, set_mac,
+    Interface, current_mac, disable_monitor, enable_monitor, list_interfaces,
+    restore_supplicant, set_mac,
 )
 from .scan import BANDS, AccessPoint, ScanSession, Station
 from .demo import DemoCaptureSession, DemoPmkidSession, DemoScanSession, demo_interfaces
@@ -106,6 +107,9 @@ class App:
         if not demo:
             self._require_authorization()
             self._check_deps()
+            # Self-heal: if a previous run was force-quit while wpa_supplicant was
+            # masked, un-mask it now so the user never has to do it by hand.
+            self._run_async(lambda: restore_supplicant(self.log))
         else:
             self.armed = True
             self.scope = "DEMO"

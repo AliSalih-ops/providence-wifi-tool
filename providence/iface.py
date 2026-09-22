@@ -147,6 +147,18 @@ def list_interfaces(log: Optional[LogFn] = None) -> List[Interface]:
     return ifaces
 
 
+def restore_supplicant(log: Optional[LogFn] = None) -> None:
+    """Undo a leftover wpa_supplicant mask (e.g. if a previous run was force-quit
+    before restoring) so the user never has to `systemctl unmask` by hand."""
+    if which("systemctl") is None:
+        return
+    if "masked" in run(["systemctl", "is-enabled", "wpa_supplicant"]).text().lower():
+        run(["systemctl", "unmask", "wpa_supplicant"], log=log)
+        run(["systemctl", "start", "wpa_supplicant"], log=log)
+        if log:
+            log("Cleared a leftover wpa_supplicant mask from a previous session.")
+
+
 def _monitor_iface_now(prefer_phy: str = "") -> Optional[str]:
     """Return the name of an interface currently in monitor mode (optionally on a phy)."""
     for i in _parse_iw_dev(_iw_dev()):
