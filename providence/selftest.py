@@ -164,6 +164,9 @@ def run() -> int:
     c.ok("scan argv sets 5GHz band", "a" == sv[sv.index("--band") + 1])
     c.ok("scan argv writes csv", "csv" in sv)
     c.eq("scan argv iface last", sv[-1], "wlan0mon")
+    # 2.4 GHz is airodump's default; --band bg breaks capture on some drivers
+    c.ok("2.4GHz scan omits redundant --band", "--band" not in scan_argv("wlan0mon", "/tmp/scan", "2.4 GHz"))
+    c.ok("dual-band scan keeps --band abg", "abg" in scan_argv("wlan0mon", "/tmp/scan", "2.4 + 5 GHz"))
     cv = capture_argv("wlan0mon", "AA:BB:CC:11:22:33", "6", "/tmp/cap")
     c.eq("capture pins bssid", cv[cv.index("--bssid") + 1], "AA:BB:CC:11:22:33")
     c.eq("capture pins channel", cv[cv.index("-c") + 1], "6")

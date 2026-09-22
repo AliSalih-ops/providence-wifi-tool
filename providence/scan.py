@@ -191,15 +191,18 @@ def airodump_band(choice: str) -> str:
 
 
 def scan_argv(mon_iface: str, prefix: str, band_choice: str = "2.4 GHz") -> list:
-    """Build the airodump-ng argv for a channel-hopping scan."""
-    return [
-        "airodump-ng",
-        "--band", airodump_band(band_choice),
-        "--write-interval", "1",
-        "--output-format", "csv",
-        "-w", prefix,
-        mon_iface,
-    ]
+    """Build the airodump-ng argv for a channel-hopping scan.
+
+    airodump-ng already defaults to 2.4 GHz, and passing `--band bg` there has
+    been observed to capture NOTHING on several mac80211 drivers (rtl8xxxu, etc.)
+    while the bare default works — so we only pass `--band` for 5 GHz / dual-band.
+    """
+    argv = ["airodump-ng"]
+    band = airodump_band(band_choice)
+    if band != "bg":                         # 2.4 GHz is the default; don't force it
+        argv += ["--band", band]
+    argv += ["--write-interval", "1", "--output-format", "csv", "-w", prefix, mon_iface]
+    return argv
 
 
 class ScanSession:

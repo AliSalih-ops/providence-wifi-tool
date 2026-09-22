@@ -231,14 +231,15 @@ class App:
         self.scan_status = ttk.Label(row, text="", style="Muted.TLabel")
         self.scan_status.pack(side="left", padx=10)
 
-        cols = ("bssid", "ch", "privacy", "pwr", "clients", "essid")
+        cols = ("bssid", "pwr", "ch", "beacons", "privacy", "cipher", "auth", "clients", "essid")
         ap_wrap = ttk.Frame(scanf)
         ap_wrap.pack(fill="both", expand=True, padx=6, pady=4)
         self.ap_tree = ttk.Treeview(ap_wrap, columns=cols, show="headings", height=8, selectmode="browse")
         ap_sb = ttk.Scrollbar(ap_wrap, orient="vertical", command=self.ap_tree.yview)
         self.ap_tree.configure(yscrollcommand=ap_sb.set)
-        for c, w, t in [("bssid", 150, "BSSID"), ("ch", 45, "Ch"), ("privacy", 90, "Privacy"),
-                        ("pwr", 55, "Pwr"), ("clients", 65, "Clients"), ("essid", 260, "ESSID")]:
+        for c, w, t in [("bssid", 140, "BSSID"), ("pwr", 45, "PWR"), ("ch", 38, "CH"),
+                        ("beacons", 62, "Beacons"), ("privacy", 66, "ENC"), ("cipher", 60, "Cipher"),
+                        ("auth", 50, "Auth"), ("clients", 58, "Clients"), ("essid", 200, "ESSID")]:
             self.ap_tree.heading(c, text=t)
             self.ap_tree.column(c, width=w, anchor="w")
         ap_sb.pack(side="right", fill="y")
@@ -823,7 +824,7 @@ class App:
         seen = set()
         for a in self.aps:
             seen.add(a.bssid)
-            vals = (a.bssid, a.channel, a.privacy, a.power, a.clients, a.essid)
+            vals = (a.bssid, a.power, a.channel, a.beacons, a.privacy, a.cipher, a.auth, a.clients, a.essid)
             if a.bssid in existing:
                 self.ap_tree.item(a.bssid, values=vals)
             else:
