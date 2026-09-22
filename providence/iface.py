@@ -148,15 +148,17 @@ def list_interfaces(log: Optional[LogFn] = None) -> List[Interface]:
 
 
 def restore_supplicant(log: Optional[LogFn] = None) -> None:
-    """Undo a leftover wpa_supplicant mask (e.g. if a previous run was force-quit
-    before restoring) so the user never has to `systemctl unmask` by hand."""
-    if which("systemctl") is None:
-        return
-    if "masked" in run(["systemctl", "is-enabled", "wpa_supplicant"]).text().lower():
-        run(["systemctl", "unmask", "wpa_supplicant"], log=log)
-        run(["systemctl", "start", "wpa_supplicant"], log=log)
-        if log:
-            log("Cleared a leftover wpa_supplicant mask from a previous session.")
+    """Clean up leftover monitor-session state at startup so a previous run (or
+    manual testing) can't leave WiFi broken: un-mask wpa_supplicant if it was
+    left masked, and turn the WiFi radio back on."""
+    if which("systemctl"):
+        if "masked" in run(["systemctl", "is-enabled", "wpa_supplicant"]).text().lower():
+            run(["systemctl", "unmask", "wpa_supplicant"], log=log)
+            run(["systemctl", "start", "wpa_supplicant"], log=log)
+            if log:
+                log("Cleared a leftover wpa_supplicant mask from a previous session.")
+    if which("nmcli"):
+        run(["nmcli", "radio", "wifi", "on"], log=None)
 
 
 def _monitor_iface_now(prefer_phy: str = "") -> Optional[str]:
