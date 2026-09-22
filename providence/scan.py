@@ -13,11 +13,10 @@ import os
 import shutil
 import subprocess
 import tempfile
-import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
-from .util import LogFn, spawn, terminate
+from .util import LogFn, is_mac, spawn, terminate
 
 
 @dataclass
@@ -32,8 +31,55 @@ class AccessPoint:
     essid: str
     clients: int = 0          # filled in from the station section
 
+    def _priv(self) -> str:
+        return (self.privacy or "").upper()
+
+    def _auth(self) -> str:
+        return (self.auth or "").upper()
+
     def is_wpa(self) -> bool:
-        return "WPA" in (self.privacy or "").upper()
+        return "WPA" in self._priv()
+
+    def is_wpa3(self) -> bool:
+        return "WPA3" in self._priv() or "SAE" in self._auth()
+
+    def is_enterprise(self) -> bool:
+        return "MGT" in self._auth() or "802.1X" in self._auth()
+
+    def is_owe(self) -> bool:
+        return "OWE" in self._priv() or "OWE" in self._auth()
+
+    def is_wep(self) -> bool:
+        return "WEP" in self._priv()
+
+    def is_open(self) -> bool:
+        return "OPN" in self._priv()
+
+    def is_sae_only(self) -> bool:
+        # Pure WPA3-SAE (no WPA2 transition) has no crackable PSK 4-way handshake.
+        return self.is_wpa3() and "PSK" not in self._auth()
+
+    def is_capturable(self) -> bool:
+        """True only for WPA/WPA2 (incl. WPA2/WPA3 transition) PSK networks —
+        the ones that actually expose a 4-way handshake / PMKID to capture."""
+        return (self.is_wpa() and not self.is_enterprise()
+                and not self.is_sae_only() and not self.is_wep())
+
+    def security_note(self) -> str:
+        """Empty if capturable; otherwise why this target has nothing to grab."""
+        if self.is_capturable():
+            return ""
+        if self.is_sae_only():
+            return "WPA3-SAE: no crackable 4-way handshake / PMKID"
+        if self.is_enterprise():
+            return "Enterprise (802.1X/MGT): no PSK handshake to capture"
+        if self.is_owe():
+            return "OWE / Enhanced Open: nothing to capture"
+        if self.is_wep():
+            return "WEP: needs a WEP attack, not handshake capture"
+        if self.is_open():
+            return "Open network: no handshake"
+        return "No WPA-PSK handshake to capture"
 
 
 @dataclass
@@ -60,7 +106,9 @@ def parse_csv(text: str) -> Tuple[List[AccessPoint], List[Station]]:
     aps: List[AccessPoint] = []
     stations: List[Station] = []
 
-    lines = text.splitlines()
+    # Split on newlines only (not str.splitlines, which also breaks on a lone
+    # CR that a hostile/odd ESSID may embed, spawning a phantom row).
+    lines = text.replace("\r\n", "\n").split("\n")
     # Find where the station section starts.
     station_hdr = None
     for idx, line in enumerate(lines):
@@ -78,12 +126,13 @@ def parse_csv(text: str) -> Tuple[List[AccessPoint], List[Station]]:
         parts = [p.strip() for p in line.split(",")]
         if len(parts) < 14:
             continue
-        # BSSID is 6 hex pairs; guards against stray/blank rows.
-        if parts[0].count(":") != 5:
+        # Require a well-formed MAC; guards against stray/blank/hostile rows.
+        if not is_mac(parts[0]):
             continue
         # ESSID may itself contain commas; everything from field 13 up to the
-        # final "Key" field is the ESSID.
+        # final "Key" field is the ESSID. Strip control chars for safe display.
         essid = ",".join(parts[13:-1]).strip() if len(parts) > 14 else parts[13]
+        essid = "".join(ch for ch in essid if ch >= " " or ch == "\t")
         aps.append(
             AccessPoint(
                 bssid=parts[0],
@@ -103,7 +152,7 @@ def parse_csv(text: str) -> Tuple[List[AccessPoint], List[Station]]:
         if not s or s.startswith("Station MAC"):
             continue
         parts = [p.strip() for p in line.split(",")]
-        if len(parts) < 6 or parts[0].count(":") != 5:
+        if len(parts) < 6 or not is_mac(parts[0]):
             continue
         st = Station(
             mac=parts[0],
@@ -155,7 +204,7 @@ class ScanSession:
         self._logpath: Optional[str] = None
 
     def start(self) -> None:
-        self._tmpdir = tempfile.mkdtemp(prefix="wifiaudit-scan-")
+        self._tmpdir = tempfile.mkdtemp(prefix="providence-scan-")
         self._prefix = os.path.join(self._tmpdir, "scan")
         self._logpath = os.path.join(self._tmpdir, "airodump.log")
         self._logfh = open(self._logpath, "w")
@@ -166,11 +215,13 @@ class ScanSession:
         """Read and parse the most recent CSV airodump has written so far."""
         if not self._prefix:
             return [], []
-        files = sorted(glob.glob(self._prefix + "-*.csv"))
+        files = glob.glob(self._prefix + "-*.csv")
         if not files:
             return [], []
+        # Newest by mtime — lexicographic sort puts "-100" before "-99".
+        newest = max(files, key=lambda p: os.path.getmtime(p))
         try:
-            with open(files[-1], "r", errors="replace") as f:
+            with open(newest, "r", errors="replace") as f:
                 text = f.read()
         except OSError:
             return [], []

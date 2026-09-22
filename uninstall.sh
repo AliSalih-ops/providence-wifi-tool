@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Remove Wifi-Cracker01 / WiFi Audit GUI. Leaves the apt packages installed.
+# Remove providence-wifi-tool / pr0v1dence WiFi Tool. Leaves the apt packages installed.
 set -euo pipefail
 
-PREFIX="/opt/wifi-cracker01"
-LAUNCHER="/usr/local/bin/wifi-audit"
-DESKTOP="/usr/share/applications/wifi-audit.desktop"
+PREFIX="/opt/pr0v1dence"
+LAUNCHER="/usr/local/bin/pr0v1dence"
+DESKTOP="/usr/share/applications/pr0v1dence.desktop"
 
 if [ "$(id -u)" -ne 0 ]; then
   exec sudo bash "$0" "$@"

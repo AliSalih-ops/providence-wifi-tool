@@ -1,4 +1,4 @@
-# WiFi Audit GUI
+# pr0v1dence WiFi Tool
 
 A single Linux desktop app that walks the whole WPA/WPA2 **handshake-capture
 workflow** in one window, instead of juggling `airmon-ng`, `airodump-ng` and
@@ -23,19 +23,35 @@ it just removes the repetitive terminal work you're doing by hand today.
 ## Install — one command (Kali / Debian)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/AliSalih-ops/Wifi-Cracker01/main/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/AliSalih-ops/providence-wifi-tool/main/install.sh | sudo bash
 ```
 
-That installs the tools it drives, drops the app in `/opt/wifi-cracker01`, and
-adds a `wifi-audit` command (and an app-menu entry). Then just:
+That installs the tools it drives, drops the app in `/opt/pr0v1dence`, and
+adds a `pr0v1dence` command (and an app-menu entry). Then just:
 
 ```bash
-wifi-audit           # launch the GUI (asks for your sudo password)
-wifi-audit --demo    # simulated data — no radio, no root — preview anywhere
+pr0v1dence           # launch the GUI (asks for your sudo password)
+pr0v1dence --demo    # simulated data — no radio, no root — preview anywhere
 ```
 
 Re-run the installer any time to update. Remove it with
-`sudo bash /opt/wifi-cracker01/uninstall.sh`.
+`sudo bash /opt/pr0v1dence/uninstall.sh`.
+
+### Or the native package (.deb)
+
+Build a real Debian package that **declares the toolchain as dependencies** —
+`apt` then pulls anything missing (aircrack-ng, hcxdumptool, macchanger, …) and
+never conflicts with a system copy, because nothing is bundled:
+
+```bash
+git clone https://github.com/AliSalih-ops/providence-wifi-tool.git
+cd providence-wifi-tool
+bash packaging/build-deb.sh
+sudo apt install ./dist/pr0v1dence-wifi-tool_*.deb
+```
+
+`pr0v1dence` is then on your PATH and in the app menu; `sudo apt remove
+pr0v1dence-wifi-tool` uninstalls it cleanly.
 
 <details>
 <summary><b>Prefer to do it manually?</b> (clone, or pipx)</summary>
@@ -46,8 +62,8 @@ you install with apt:
 ```bash
 sudo apt update
 sudo apt install -y python3-tk aircrack-ng iw iproute2 hcxtools hcxdumptool macchanger
-git clone https://github.com/AliSalih-ops/Wifi-Cracker01.git
-cd Wifi-Cracker01
+git clone https://github.com/AliSalih-ops/providence-wifi-tool.git
+cd providence-wifi-tool
 ./run.sh
 ```
 
@@ -56,12 +72,12 @@ cd Wifi-Cracker01
 - `hcxdumptool` → clientless **PMKID** capture
 - `macchanger` → randomize/restore the adapter **MAC**
 
-Or install the `wifi-audit` command into an isolated environment with pipx
+Or install the `pr0v1dence` command into an isolated environment with pipx
 (`sudo apt install pipx`), then run it with sudo:
 
 ```bash
-pipx install git+https://github.com/AliSalih-ops/Wifi-Cracker01.git
-sudo -E env "PATH=$PATH" wifi-audit
+pipx install git+https://github.com/AliSalih-ops/providence-wifi-tool.git
+sudo -E env "PATH=$PATH" pr0v1dence
 ```
 
 </details>
@@ -69,7 +85,7 @@ sudo -E env "PATH=$PATH" wifi-audit
 ## Run
 
 ```bash
-wifi-audit          # if installed via install.sh / pipx
+pr0v1dence          # if installed via install.sh / pipx
 ./run.sh            # from a clone — launches the GUI (re-execs with sudo, radio work needs root)
 ./run.sh --demo     # simulated data, no radio, no root — preview the UI anywhere
 ./run.sh --selftest # offline logic tests, then exit
@@ -78,9 +94,9 @@ wifi-audit          # if installed via install.sh / pipx
 Or directly:
 
 ```bash
-sudo python3 -m wifiaudit          # real
-python3 -m wifiaudit --demo        # simulated
-python3 -m wifiaudit --selftest    # tests
+sudo python3 -m providence          # real
+python3 -m providence --demo        # simulated
+python3 -m providence --selftest    # tests
 ```
 
 You need a wireless adapter that supports **monitor mode + injection**. Common
@@ -102,7 +118,7 @@ Realtek RTL8812AU (with the `8812au` dkms driver).
    privacy, signal, #clients, ESSID). A status line shows the live network
    count. Select your target; its associated clients appear below.
 3. **Deauth & capture** — set where captures are saved (defaults to
-   `~/wifi-audit-captures`; *Open folder* reveals it). *Start capture* pins
+   `~/pr0v1dence-captures`; *Open folder* reveals it). *Start capture* pins
    `airodump-ng` to the target's channel/BSSID and writes a `.cap`; a live timer
    shows elapsed time and handshake state. Pick a client (or tick *broadcast*),
    set a small frame count, and *Send deauth* to nudge a reconnect. The app
@@ -141,11 +157,11 @@ hashcat -m 22000 capture.22000 wordlist.txt
 ## Layout
 
 ```
-wifi-audit-gui/
+providence-wifi-tool/
   run.sh              launcher (handles sudo + tk check)
   selftest.py         offline logic tests
   requirements.txt    system-package notes (no pip deps)
-  wifiaudit/
+  providence/
     __main__.py       CLI entry (--demo / --selftest)
     util.py           subprocess helpers (run/spawn/terminate)
     deps.py           external-tool detection + apt hints

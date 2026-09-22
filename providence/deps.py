@@ -33,7 +33,7 @@ TOOLS: List[Tool] = [
     Tool("airodump-ng", "scan for networks/clients and capture the handshake", "aircrack-ng", True),
     Tool("aireplay-ng", "send targeted deauthentication frames", "aircrack-ng", True),
     Tool("aircrack-ng", "verify a captured 4-way handshake in the .cap", "aircrack-ng", True),
-    Tool("hcxpcapngtool", "export capture to hashcat 22000 format (optional)", "hcxtools", False),
+    Tool("hcxpcapngtool", "PMKID detection + export to hashcat 22000 (required for PMKID)", "hcxtools", False),
     Tool("hcxdumptool", "capture PMKID / clientless (no-deauth) handshakes (optional)", "hcxdumptool", False),
     Tool("macchanger", "randomize or restore the adapter MAC address (optional)", "macchanger", False),
 ]

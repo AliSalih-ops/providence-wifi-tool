@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import List, Optional
 
 from .util import CmdResult, run, LogFn
@@ -23,11 +23,14 @@ class Interface:
     chipset: str = ""          # best-effort, from airmon-ng
     mode: str = ""             # "managed" / "monitor" / ...
     supports_monitor: bool = False
+    bands: tuple = ()          # e.g. ("2.4",) or ("2.4", "5")
 
     def label(self) -> str:
         bits = [self.name]
         if self.driver:
             bits.append(self.driver)
+        if self.bands:
+            bits.append("/".join(self.bands) + " GHz")
         if self.supports_monitor:
             bits.append("monitor-capable")
         else:
@@ -100,6 +103,21 @@ def _supported_modes(info_text: str) -> set:
     return modes
 
 
+def _supported_bands(info_text: str) -> set:
+    """Which frequency bands a phy supports, from its `iw phy info` frequency
+    list. 2.4 GHz (<3 GHz), 5 GHz (~5 GHz), 6 GHz (>5.925 GHz)."""
+    bands = set()
+    for m in re.finditer(r"\*\s*(\d+)(?:\.\d+)?\s*MHz", info_text):
+        f = int(m.group(1))
+        if f < 3000:
+            bands.add("2.4")
+        elif 4900 <= f <= 5925:
+            bands.add("5")
+        elif f > 5925:
+            bands.add("6")
+    return bands
+
+
 def _phy_supports_monitor(phy: str) -> bool:
     """Ask `iw phy <phy> info` whether 'monitor' is a supported interface mode."""
     if not phy:
@@ -111,9 +129,16 @@ def _phy_supports_monitor(phy: str) -> bool:
 def list_interfaces(log: Optional[LogFn] = None) -> List[Interface]:
     """Discover wireless interfaces and annotate each with driver + capability."""
     ifaces = _parse_iw_dev(_iw_dev())
+    info_cache: dict = {}
     for i in ifaces:
         i.driver = _driver_of(i.name)
-        i.supports_monitor = _phy_supports_monitor(i.phy)
+        if i.phy:
+            info = info_cache.get(i.phy)
+            if info is None:
+                info = run(["iw", "phy", i.phy, "info"]).text()  # fetch once per phy
+                info_cache[i.phy] = info
+            i.supports_monitor = "monitor" in _supported_modes(info)
+            i.bands = tuple(b for b in ("2.4", "5", "6") if b in _supported_bands(info))
     if log:
         if ifaces:
             log(f"Found {len(ifaces)} wireless interface(s): " + ", ".join(i.name for i in ifaces))
@@ -167,10 +192,15 @@ def disable_monitor(mon_iface: str, restore_services: bool = True, log: Optional
     """Take the card out of monitor mode and (optionally) bring networking back."""
     run(["airmon-ng", "stop", mon_iface], timeout=30, log=log)
     if restore_services:
-        # Best-effort; different distros use different service managers.
+        # `airmon-ng check kill` stops BOTH NetworkManager and wpa_supplicant,
+        # so bring both back. Best-effort across service managers / distros.
         r = run(["systemctl", "restart", "NetworkManager"], log=log)
         if not r.ok:
-            run(["service", "network-manager", "restart"], log=log)
+            r2 = run(["service", "network-manager", "restart"], log=log)
+            if not r2.ok:
+                # Only when NetworkManager truly isn't here — restarting the
+                # supplicant on an NM stack would bounce the link NM just restored.
+                run(["systemctl", "restart", "wpa_supplicant"], log=log)
     if log:
         log("Monitor mode disabled; networking restore attempted.")
 
@@ -221,8 +251,12 @@ def set_mac(iface: str, mode: str = "random", mac: Optional[str] = None,
     interface once monitor mode is on) so the spoof sticks for captures/deauths.
     """
     run(["ip", "link", "set", iface, "down"], log=log)
-    res = run(macchanger_argv(iface, mode, mac), timeout=15, log=log)
-    run(["ip", "link", "set", iface, "up"], log=log)
+    try:
+        res = run(macchanger_argv(iface, mode, mac), timeout=15, log=log)
+    finally:
+        # Always bring the link back up, even if macchanger_argv raised on a
+        # bad mode or run() somehow failed — never leave the card DOWN.
+        run(["ip", "link", "set", iface, "up"], log=log)
     if res.rc == 127:
         if log:
             log("macchanger not installed (apt install macchanger).")

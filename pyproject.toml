@@ -3,8 +3,8 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "wifi-audit-gui"
-version = "0.1.0"
+name = "pr0v1dence-wifi-tool"
+version = "1.0.0"
 description = "GUI for authorized WPA/WPA2 handshake & PMKID capture, built on the aircrack-ng suite"
 readme = "README.md"
 requires-python = ">=3.8"
@@ -24,11 +24,11 @@ classifiers = [
 dependencies = []
 
 [project.urls]
-Homepage = "https://github.com/AliSalih-ops/Wifi-Cracker01"
-Issues = "https://github.com/AliSalih-ops/Wifi-Cracker01/issues"
+Homepage = "https://github.com/AliSalih-ops/providence-wifi-tool"
+Issues = "https://github.com/AliSalih-ops/providence-wifi-tool/issues"
 
 [project.scripts]
-wifi-audit = "wifiaudit.__main__:main"
+pr0v1dence = "providence.__main__:main"
 
 [tool.setuptools]
-packages = ["wifiaudit"]
+packages = ["providence"]

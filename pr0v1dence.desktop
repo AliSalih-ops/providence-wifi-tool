@@ -1,9 +1,9 @@
 [Desktop Entry]
 Type=Application
-Name=WiFi Audit GUI
+Name=pr0v1dence WiFi Tool
 GenericName=WPA handshake & PMKID capture
 Comment=Authorized WPA/WPA2 handshake and PMKID capture (aircrack-ng front-end)
-Exec=wifi-audit
+Exec=pr0v1dence
 Icon=network-wireless
 Terminal=true
 Categories=Network;Security;System;

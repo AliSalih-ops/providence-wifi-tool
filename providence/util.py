@@ -7,6 +7,8 @@ errors, and logging, so the rest of the code can stay readable.
 
 from __future__ import annotations
 
+import os
+import re
 import shutil
 import subprocess
 import time
@@ -68,6 +70,10 @@ def run(
             input=input_text,
             capture_output=True,
             text=True,
+            # 802.11 SSIDs are arbitrary bytes and tools echo them raw; strict
+            # UTF-8 decoding would raise mid-capture and silently fail verify.
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout,
         )
         res = CmdResult(argv, proc.returncode, proc.stdout, proc.stderr, started, time.time())
@@ -130,3 +136,28 @@ def terminate(proc: Optional[subprocess.Popen], log: Optional[LogFn] = None) -> 
     except Exception as e:  # pragma: no cover - defensive
         if log:
             log(f"  (failed to stop pid {proc.pid}: {e})")
+
+
+_MAC_RE = re.compile(r"^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$")
+
+
+def reown(path: str) -> None:
+    """When running under sudo, give a path back to the invoking user so the
+    operator's captures/logs in their home aren't left root-owned (best-effort)."""
+    uid = os.environ.get("SUDO_UID")
+    gid = os.environ.get("SUDO_GID")
+    if uid and hasattr(os, "chown"):
+        try:
+            os.chown(path, int(uid), int(gid) if gid else -1)
+        except OSError:
+            pass
+
+
+def is_mac(value: str) -> bool:
+    """True if `value` is a well-formed 48-bit MAC like aa:bb:cc:dd:ee:ff.
+
+    Used to validate BSSIDs / client MACs before they reach aireplay-ng or
+    airodump-ng as arguments, so a malformed or hostile scan row can't smuggle
+    an option-looking token (e.g. starting with '-') onto a command line.
+    """
+    return bool(value) and bool(_MAC_RE.match(value.strip()))

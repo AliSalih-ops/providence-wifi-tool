@@ -26,7 +26,9 @@ from tkinter import filedialog, messagebox, ttk
 from . import __app_name__, __version__, deps
 from .capture import (
     CaptureSession, CaptureTarget, PmkidSession, injection_test, is_valid_channel,
+    pmkid_detection_available,
 )
+from .util import reown
 from .iface import (
     Interface, current_mac, disable_monitor, enable_monitor, list_interfaces, set_mac,
 )
@@ -40,16 +42,20 @@ C = {
     "panel": "#181825",
     "row": "#11111b",
     "fg": "#cdd6f4",
-    "muted": "#7f849c",
+    "muted": "#a6adc8",       # subtext0 — passes WCAG AA on the dark bg
     "accent": "#89b4fa",
     "good": "#a6e3a1",
     "warn": "#f9e2af",
     "bad": "#f38ba8",
+    "bad_hover": "#eba0ac",   # lighter red for Danger button hover
     "sel": "#313244",
 }
 
-SCAN_POLL_MS = 2000
-AUTOVERIFY_MS = 5000
+SCAN_POLL_MS = 2000       # how often the scan CSV is re-read
+AUTOVERIFY_MS = 5000      # how often a running capture/PMKID is auto-checked
+CAPTURE_TICK_MS = 1000    # elapsed-timer / liveness tick cadence
+PUMP_MS = 100             # UI queue drain cadence
+LOG_MAX_LINES = 2000      # trim the activity log beyond this to bound memory
 
 
 class App:
@@ -67,20 +73,27 @@ class App:
         self.armed = False                 # authorization accepted
         self.scope = ""                    # what the user said they're authorized to test
         # Captures persist here (not /tmp) so they're easy to find afterwards.
-        self.out_dir = os.path.join(os.path.expanduser("~"), "wifi-audit-captures")
+        self.out_dir = os.path.join(os.path.expanduser("~"), "pr0v1dence-captures")
 
         self._log_q: "queue.Queue[str]" = queue.Queue()
         self._ui_q: "queue.Queue[Callable]" = queue.Queue()
         self._verify_busy = False
         self._cap_start: Optional[float] = None
         self._hs_ok = False                # whether the target's handshake is captured
+        self._cap_gen = 0                  # bumped each capture; stale verifies ignored
         self._pmkid_start: Optional[float] = None
         self._pmkid_ok = False
         self._pmkid_busy = False
+        self._pmkid_gen = 0
+        self._timers: dict = {}            # named after() ids, so we never double-schedule
+        self._log_fh = None                # on-disk activity log (opened lazily)
 
         self._build_style()
         self._build_widgets()
-        self.root.after(100, self._pump)
+        # Route uncaught exceptions from Tk callbacks to the log instead of the
+        # console (and instead of silently killing a periodic after() loop).
+        self.root.report_callback_exception = self._on_tk_exception
+        self.root.after(PUMP_MS, self._pump)
 
         self.log(f"{__app_name__} {__version__}" + ("  [DEMO MODE - nothing is transmitted]" if demo else ""))
         if not demo:
@@ -96,8 +109,8 @@ class App:
     def _build_style(self) -> None:
         self.root.title(f"{__app_name__} {__version__}")
         self.root.configure(bg=C["bg"])
-        self.root.geometry("980x760")
-        self.root.minsize(860, 640)
+        self.root.geometry("1000x880")
+        self.root.minsize(840, 600)
 
         st = ttk.Style()
         st.theme_use("clam")
@@ -113,11 +126,46 @@ class App:
                background=[("active", C["accent"]), ("disabled", C["panel"])],
                foreground=[("active", C["bg"]), ("disabled", C["muted"])])
         st.configure("Accent.TButton", background=C["accent"], foreground=C["bg"])
-        st.map("Accent.TButton", background=[("active", C["good"])])
+        st.map("Accent.TButton", background=[("active", C["good"]), ("disabled", C["panel"])],
+               foreground=[("disabled", C["muted"])])
         st.configure("Danger.TButton", background=C["bad"], foreground=C["bg"])
-        st.configure("TCombobox", fieldbackground=C["panel"], background=C["sel"], foreground=C["fg"])
-        st.configure("TCheckbutton", background=C["bg"], foreground=C["fg"])
-        st.map("TCheckbutton", background=[("active", C["bg"])])
+        st.map("Danger.TButton", background=[("active", C["bad_hover"]), ("disabled", C["panel"])],
+               foreground=[("active", C["bg"]), ("disabled", C["muted"])])
+
+        # Combobox: clam ships a hard-coded readonly-state map (light-grey field)
+        # that always beats configure(), so the readonly text renders greyed. We
+        # must override it with our own state map, else the interface/band names
+        # are unreadable.
+        st.configure("TCombobox", fieldbackground=C["panel"], background=C["sel"],
+                     foreground=C["fg"], arrowcolor=C["fg"])
+        st.map("TCombobox",
+               fieldbackground=[("readonly", C["panel"]), ("disabled", C["panel"])],
+               foreground=[("readonly", C["fg"]), ("disabled", C["muted"])],
+               selectbackground=[("readonly", C["panel"])],
+               selectforeground=[("readonly", C["fg"])],
+               arrowcolor=[("disabled", C["muted"])])
+        # The drop-down popup is a classic tk Listbox styled via the option DB.
+        self.root.option_add("*TCombobox*Listbox.background", C["panel"])
+        self.root.option_add("*TCombobox*Listbox.foreground", C["fg"])
+        self.root.option_add("*TCombobox*Listbox.selectBackground", C["accent"])
+        self.root.option_add("*TCombobox*Listbox.selectForeground", C["bg"])
+
+        st.configure("TSpinbox", fieldbackground=C["panel"], background=C["sel"],
+                     foreground=C["fg"], arrowcolor=C["fg"])
+        st.map("TSpinbox", fieldbackground=[("disabled", C["panel"])],
+               foreground=[("disabled", C["muted"])], arrowcolor=[("disabled", C["muted"])])
+
+        # clam honors indicatorbackground/foreground (NOT indicatorcolor) for the
+        # check box, so the indicator was rendering default white without these.
+        st.configure("TCheckbutton", background=C["bg"], foreground=C["fg"],
+                     indicatorbackground=C["panel"], indicatorforeground=C["bg"],
+                     upperbordercolor=C["sel"], lowerbordercolor=C["sel"])
+        st.map("TCheckbutton", background=[("active", C["bg"])],
+               indicatorbackground=[("selected", C["accent"]), ("disabled", C["panel"]),
+                                    ("!selected", C["panel"])],
+               indicatorforeground=[("selected", C["bg"])],
+               foreground=[("disabled", C["muted"])])
+
         st.configure("Treeview", background=C["panel"], fieldbackground=C["panel"],
                      foreground=C["fg"], rowheight=24, borderwidth=0)
         st.map("Treeview", background=[("selected", C["accent"])], foreground=[("selected", C["bg"])])
@@ -134,7 +182,7 @@ class App:
         self.iface_var = tk.StringVar()
         self.iface_combo = ttk.Combobox(bar, textvariable=self.iface_var, state="readonly", width=48)
         self.iface_combo.grid(row=0, column=0, padx=6, pady=8, sticky="w")
-        self.iface_combo.bind("<<ComboboxSelected>>", lambda e: self._update_mac_label())
+        self.iface_combo.bind("<<ComboboxSelected>>", lambda e: self._on_iface_change())
         ttk.Button(bar, text="Refresh", command=self.refresh_interfaces).grid(row=0, column=1, padx=4)
         self.btn_mon = ttk.Button(bar, text="Enable monitor mode", style="Accent.TButton",
                                   command=self.on_enable_monitor)
@@ -164,27 +212,38 @@ class App:
         self.btn_scan.pack(side="left", padx=6, pady=6)
         ttk.Label(row, text="Band:", style="Muted.TLabel").pack(side="left")
         self.band_var = tk.StringVar(value="2.4 GHz")
-        ttk.Combobox(row, textvariable=self.band_var, state="readonly", width=12,
-                     values=list(BANDS.keys())).pack(side="left", padx=4)
+        self.band_combo = ttk.Combobox(row, textvariable=self.band_var, state="readonly", width=12,
+                                       values=list(BANDS.keys()))
+        self.band_combo.pack(side="left", padx=4)
         self.scan_status = ttk.Label(row, text="", style="Muted.TLabel")
         self.scan_status.pack(side="left", padx=10)
 
         cols = ("bssid", "ch", "privacy", "pwr", "clients", "essid")
-        self.ap_tree = ttk.Treeview(scanf, columns=cols, show="headings", height=8, selectmode="browse")
+        ap_wrap = ttk.Frame(scanf)
+        ap_wrap.pack(fill="both", expand=True, padx=6, pady=4)
+        self.ap_tree = ttk.Treeview(ap_wrap, columns=cols, show="headings", height=8, selectmode="browse")
+        ap_sb = ttk.Scrollbar(ap_wrap, orient="vertical", command=self.ap_tree.yview)
+        self.ap_tree.configure(yscrollcommand=ap_sb.set)
         for c, w, t in [("bssid", 150, "BSSID"), ("ch", 45, "Ch"), ("privacy", 90, "Privacy"),
                         ("pwr", 55, "Pwr"), ("clients", 65, "Clients"), ("essid", 260, "ESSID")]:
             self.ap_tree.heading(c, text=t)
             self.ap_tree.column(c, width=w, anchor="w")
-        self.ap_tree.pack(fill="both", expand=True, padx=6, pady=4)
+        ap_sb.pack(side="right", fill="y")
+        self.ap_tree.pack(side="left", fill="both", expand=True)
         self.ap_tree.bind("<<TreeviewSelect>>", self.on_ap_select)
 
         ttk.Label(scanf, text="Clients on the selected network:", style="Muted.TLabel").pack(anchor="w", padx=8)
         ccols = ("mac", "pwr", "pkts")
-        self.cli_tree = ttk.Treeview(scanf, columns=ccols, show="headings", height=4, selectmode="browse")
+        cli_wrap = ttk.Frame(scanf)
+        cli_wrap.pack(fill="x", padx=6, pady=4)
+        self.cli_tree = ttk.Treeview(cli_wrap, columns=ccols, show="headings", height=4, selectmode="browse")
+        cli_sb = ttk.Scrollbar(cli_wrap, orient="vertical", command=self.cli_tree.yview)
+        self.cli_tree.configure(yscrollcommand=cli_sb.set)
         for c, w, t in [("mac", 180, "Client MAC"), ("pwr", 60, "Pwr"), ("pkts", 80, "Packets")]:
             self.cli_tree.heading(c, text=t)
             self.cli_tree.column(c, width=w, anchor="w")
-        self.cli_tree.pack(fill="x", padx=6, pady=4)
+        cli_sb.pack(side="right", fill="y")
+        self.cli_tree.pack(side="left", fill="both", expand=True)
 
         # --- capture panel ---
         capf = ttk.Labelframe(self.root, text="3 - Deauth & capture handshake", style="Panel.TLabelframe")
@@ -253,12 +312,15 @@ class App:
         # --- log ---
         logf = ttk.Labelframe(self.root, text="Activity log", style="Panel.TLabelframe")
         logf.pack(fill="both", expand=True, **pad)
-        self.log_txt = tk.Text(logf, height=9, bg=C["row"], fg=C["fg"], insertbackground=C["fg"],
-                               relief="flat", wrap="word")
-        self.log_txt.pack(fill="both", expand=True, padx=6, pady=6)
+        log_sb = ttk.Scrollbar(logf, orient="vertical")
+        log_sb.pack(side="right", fill="y")
+        self.log_txt = tk.Text(logf, height=8, bg=C["row"], fg=C["fg"], insertbackground=C["fg"],
+                               relief="flat", wrap="word", yscrollcommand=log_sb.set)
+        self.log_txt.pack(side="left", fill="both", expand=True, padx=6, pady=6)
+        log_sb.configure(command=self.log_txt.yview)
         self.log_txt.configure(state="disabled")
 
-        self._set_capture_enabled(False)
+        self._refresh_action_states()
 
     # ------------------------------------------------------------- auth gate
     def _require_authorization(self) -> None:
@@ -311,19 +373,46 @@ class App:
         """Thread-safe: queue a line to be shown on the main thread."""
         self._log_q.put(str(msg))
 
+    def _disk_log(self, line: str) -> None:
+        """Append one log line to an on-disk audit trail (best-effort)."""
+        try:
+            if self._log_fh is None and self.out_dir and not self.demo:
+                os.makedirs(self.out_dir, exist_ok=True)
+                self._log_fh = open(os.path.join(self.out_dir, "pr0v1dence.log"), "a", encoding="utf-8")
+                reown(self.out_dir)
+                # Scope is written by the "Authorization confirmed. Scope: …" log
+                # line, so the banner stays scope-free (it may open pre-auth).
+                self._log_fh.write("\n===== session start =====\n")
+            if self._log_fh:
+                self._log_fh.write(line.rstrip() + "\n")
+                self._log_fh.flush()
+        except OSError:
+            self._log_fh = None
+
     def _pump(self) -> None:
         # drain log lines
-        drained = False
+        appended = False
         while True:
             try:
                 line = self._log_q.get_nowait()
             except queue.Empty:
                 break
-            drained = True
+            appended = True
             self.log_txt.configure(state="normal")
             self.log_txt.insert("end", line.rstrip() + "\n")
-            self.log_txt.see("end")
+            self._disk_log(line)
             self.log_txt.configure(state="disabled")
+        if appended:
+            # Bound the widget's memory: trim oldest lines past the cap.
+            try:
+                total = int(self.log_txt.index("end-1c").split(".")[0])
+                if total > LOG_MAX_LINES:
+                    self.log_txt.configure(state="normal")
+                    self.log_txt.delete("1.0", f"{total - LOG_MAX_LINES}.0")
+                    self.log_txt.configure(state="disabled")
+            except (tk.TclError, ValueError):
+                pass
+            self.log_txt.see("end")
         # run any queued UI callbacks from worker threads
         while True:
             try:
@@ -334,7 +423,11 @@ class App:
                 fn()
             except Exception as e:  # pragma: no cover - defensive
                 self.log(f"UI callback error: {e}")
-        self.root.after(100, self._pump)
+        self.root.after(PUMP_MS, self._pump)
+
+    def _on_tk_exception(self, exc, val, tb) -> None:
+        """Global Tk callback error handler — surface instead of dying quietly."""
+        self.log(f"Internal error: {val}")
 
     def _run_async(self, work: Callable, done: Optional[Callable] = None) -> None:
         """Run `work()` on a thread; when finished, call `done(result)` on main thread."""
@@ -347,6 +440,35 @@ class App:
             if done:
                 self._ui_q.put(lambda: done(result))
         threading.Thread(target=runner, daemon=True).start()
+
+    # ----------------------------------------------------------- timers
+    def _schedule(self, name: str, ms: int, fn: Callable) -> None:
+        """(Re)arm a named periodic timer, cancelling any prior one so Stop/Start
+        can never leave two copies of the same loop running."""
+        self._cancel(name)
+        self._timers[name] = self.root.after(ms, fn)
+
+    def _cancel(self, name: str) -> None:
+        tid = self._timers.pop(name, None)
+        if tid is not None:
+            try:
+                self.root.after_cancel(tid)
+            except tk.TclError:
+                pass
+
+    def _cancel_all_timers(self) -> None:
+        for name in list(self._timers):
+            self._cancel(name)
+
+    def _deauth_count(self) -> int:
+        """Read the deauth-frame spinbox safely (a typed-in blank/garbage value
+        raises TclError from an IntVar) and clamp to a sane 1..64."""
+        try:
+            n = int(self.deauth_count.get())
+        except (tk.TclError, ValueError):
+            n = 5
+            self.deauth_count.set(5)
+        return max(1, min(64, n))
 
     # --------------------------------------------------------------- deps
     def _check_deps(self) -> None:
@@ -380,6 +502,7 @@ class App:
                 if not self.demo:
                     self.log("No wireless interfaces. On this machine you can pass --demo to preview the UI.")
             self._update_mac_label()
+            self._update_band_choices()
         self._run_async(work, done)
 
     def _selected_interface(self) -> Optional[Interface]:
@@ -419,6 +542,7 @@ class App:
 
     def on_restore(self) -> None:
         if self.demo:
+            self._stop_all()      # match the real teardown: stop scan + timers
             self.mon_iface = None
             self._set_status()
             self.log("[demo] networking restored")
@@ -445,7 +569,7 @@ class App:
         parts.append(f"monitor: {self.mon_iface}" if self.mon_iface else "monitor: off")
         self.status_lbl.configure(text="   ".join(parts),
                                   foreground=C["good"] if self.mon_iface else C["muted"])
-        self._set_capture_enabled(bool(self.mon_iface))
+        self._refresh_action_states()
 
     def on_injection_test(self) -> None:
         if not self._guard() or not self._need_monitor():
@@ -474,12 +598,9 @@ class App:
             self.log(f"Captures will be saved to {d}")
 
     def on_open_folder(self) -> None:
-        target = self.out_dir
-        try:
-            os.makedirs(target, exist_ok=True)
-        except OSError as e:
-            messagebox.showerror("Open folder", str(e))
+        if not self._ensure_out_dir():
             return
+        target = self.out_dir
         # Best-effort cross-desktop open; harmless no-op if it's unavailable.
         for opener in ("xdg-open", "open"):
             if shutil.which(opener):
@@ -501,9 +622,73 @@ class App:
 
     def _update_mac_label(self) -> None:
         if self.demo:
+            self.mac_lbl.configure(text="02:00:00:11:22:33  (demo)")
+            self._update_mac_buttons()
             return
         iface = self._transmit_iface()
-        self.mac_lbl.configure(text=current_mac(iface) if iface else "-")
+        self.mac_lbl.configure(text=(current_mac(iface) or "-") if iface else "-")
+        self._update_mac_buttons()
+
+    def _update_mac_buttons(self) -> None:
+        """MAC spoofing needs only an interface (works before OR after monitor
+        mode); disable while a capture is transmitting."""
+        busy = (self.capture and self.capture.running()) or (self.pmkid and self.pmkid.running())
+        ok = self.armed and self._transmit_iface() is not None and not busy
+        state = "normal" if ok else "disabled"
+        self.btn_macrand.configure(state=state)
+        self.btn_macrestore.configure(state=state)
+
+    # ------------------------------------------------------- out dir / bands
+    def _ensure_out_dir(self) -> bool:
+        try:
+            os.makedirs(self.out_dir, exist_ok=True)
+            try:
+                os.chmod(self.out_dir, 0o700)
+            except OSError:
+                pass
+            reown(self.out_dir)
+            return True
+        except OSError as e:
+            messagebox.showerror("Folder", f"Can't create output folder:\n{e}")
+            return False
+
+    def _update_band_choices(self) -> None:
+        """Restrict the band selector to what the chosen adapter actually does,
+        so you can't pick 5 GHz on a 2.4-only card and silently scan nothing."""
+        i = self._selected_interface()
+        supported = set(getattr(i, "bands", ()) or ()) if i else set()
+        if not supported:                       # demo / unknown -> offer all
+            self.band_combo["values"] = list(BANDS.keys())
+            return
+        vals = []
+        if "2.4" in supported:
+            vals.append("2.4 GHz")
+        if "5" in supported:
+            vals.append("5 GHz")
+        if "2.4" in supported and "5" in supported:
+            vals.append("2.4 + 5 GHz")
+        self.band_combo["values"] = vals
+        if self.band_var.get() not in vals and vals:
+            self.band_var.set(vals[0])
+
+    def _on_iface_change(self) -> None:
+        self._update_mac_label()
+        self._update_band_choices()
+
+    @staticmethod
+    def _channel_is_5ghz(channel) -> bool:
+        try:
+            return int(channel) > 14
+        except (TypeError, ValueError):
+            return False
+
+    def _adapter_can_reach(self, channel) -> bool:
+        """False when the target is 5 GHz but the adapter is 2.4-only."""
+        if not self._channel_is_5ghz(channel):
+            return True
+        i = self._selected_interface()
+        bands = set(getattr(i, "bands", ()) or ()) if i else set()
+        return (not bands) or ("5" in bands)
 
     def _change_mac(self, mode: str) -> None:
         if not self._guard():
@@ -555,9 +740,10 @@ class App:
             return
         self.btn_scan.configure(text="Stop scan")
         self.scan_status.configure(text=f"scanning {self.band_var.get()}...", foreground=C["warn"])
-        self.root.after(SCAN_POLL_MS, self._poll_scan)
+        self._schedule("scan", SCAN_POLL_MS, self._poll_scan)
 
     def _stop_scan(self, msg: str = "") -> None:
+        self._cancel("scan")
         if self.scan:
             self.scan.stop()
             self.scan = None
@@ -581,9 +767,10 @@ class App:
         self.aps = sorted(aps, key=lambda a: _pwr_key(a.power), reverse=True)
         self.stations = stations
         self._refresh_ap_tree()
+        self._refresh_client_tree()   # keep client list + target label fresh
         self.scan_status.configure(text=f"scanning {self.band_var.get()} - {len(self.aps)} networks",
                                    foreground=C["warn"])
-        self.root.after(SCAN_POLL_MS, self._poll_scan)
+        self._schedule("scan", SCAN_POLL_MS, self._poll_scan)
 
     def _refresh_ap_tree(self) -> None:
         selected = self._selected_bssid()
@@ -602,15 +789,36 @@ class App:
             self.ap_tree.selection_set(selected)
 
     def on_ap_select(self, _evt=None) -> None:
+        self._refresh_client_tree()
+
+    def _refresh_client_tree(self) -> None:
+        """Rebuild the client table for the selected AP, preserving the client
+        selection, and keep the target label honest when the AP disappears."""
         bssid = self._selected_bssid()
         ap = next((a for a in self.aps if a.bssid == bssid), None)
-        if ap:
-            self.target_lbl.configure(text=f"Target: {ap.essid}  [{ap.bssid}]  ch {ap.channel}  {ap.privacy}")
-        # refill clients table for this AP
-        self.cli_tree.delete(*self.cli_tree.get_children())
+        if not ap:
+            self.target_lbl.configure(text="Target: (none selected)")
+            self.cli_tree.delete(*self.cli_tree.get_children())
+            return
+        note = ap.security_note()
+        label = f"Target: {ap.essid}  [{ap.bssid}]  ch {ap.channel}  {ap.privacy}"
+        if note:
+            label += f"   ⚠ {note}"
+        self.target_lbl.configure(text=label, foreground=C["warn"] if note else C["fg"])
+
+        keep = self._selected_client()
+        current = {s.mac for s in self.stations if s.bssid == bssid}
+        for iid in set(self.cli_tree.get_children()) - current:
+            self.cli_tree.delete(iid)
         for s in self.stations:
             if s.bssid == bssid:
-                self.cli_tree.insert("", "end", iid=s.mac, values=(s.mac, s.power, s.packets))
+                vals = (s.mac, s.power, s.packets)
+                if s.mac in self.cli_tree.get_children():
+                    self.cli_tree.item(s.mac, values=vals)
+                else:
+                    self.cli_tree.insert("", "end", iid=s.mac, values=vals)
+        if keep and keep in current:
+            self.cli_tree.selection_set(keep)
 
     def _selected_bssid(self) -> Optional[str]:
         sel = self.ap_tree.selection()
@@ -633,22 +841,24 @@ class App:
         if not ap:
             messagebox.showinfo("Capture", "Select a target network in the scan table first.")
             return
-        if not ap.is_wpa() and not self.demo:
-            if not messagebox.askyesno("Capture", f"{ap.essid} is {ap.privacy}, not WPA. There is no "
-                                                  "WPA handshake to capture. Continue anyway?"):
+        if not ap.is_capturable() and not self.demo:
+            note = ap.security_note() or "This network has no WPA-PSK handshake to capture."
+            if not messagebox.askyesno("Capture", f"{ap.essid}: {note}\n\nCapture anyway?"):
                 return
         if not is_valid_channel(ap.channel) and not self.demo:
             messagebox.showwarning("Capture", f"'{ap.essid}' has no usable channel ({ap.channel!r}). "
                                               "Re-scan until a real channel shows before capturing.")
             return
+        if not self._adapter_can_reach(ap.channel) and not self.demo:
+            messagebox.showwarning("Capture", f"'{ap.essid}' is on a 5 GHz channel ({ap.channel}), but the "
+                                              "selected adapter is 2.4 GHz-only — it can't capture this "
+                                              "network. Use the 2.4 GHz SSID or a dual-band adapter.")
+            return
         # Free the card from channel-hopping scan so capture can pin the channel.
         if self.scan and self.scan.running():
             self._stop_scan("Scan stopped so capture can lock the channel.")
 
-        try:
-            os.makedirs(self.out_dir, exist_ok=True)
-        except OSError as e:
-            messagebox.showerror("Capture", f"Can't create output folder:\n{e}")
+        if not self._ensure_out_dir():
             return
 
         target = CaptureTarget(bssid=ap.bssid, channel=ap.channel, essid=ap.essid)
@@ -662,20 +872,24 @@ class App:
             if tail:
                 self.log(tail)
             return
+        self._cap_gen += 1
         self._hs_ok = False
+        self._verify_busy = False     # a rapid stop->start must not stay "busy"
         self._set_handshake(False)
         self._cap_start = time.time()
-        self.btn_cap.configure(state="disabled")
-        self.root.after(AUTOVERIFY_MS, self._auto_verify)
-        self.root.after(1000, self._capture_tick)
+        self._refresh_action_states()
+        self._schedule("autoverify", AUTOVERIFY_MS, self._auto_verify)
+        self._schedule("captick", CAPTURE_TICK_MS, self._capture_tick)
 
     def on_capture_stop(self) -> None:
+        self._cancel("captick")
+        self._cancel("autoverify")
         if self.capture:
             self.capture.stop()
             self.log("Capture stopped.")
         self._cap_start = None
-        self.btn_cap.configure(state="normal")
         self.cap_status.configure(text="")
+        self._refresh_action_states()
 
     def _capture_tick(self) -> None:
         """Once a second: show elapsed time and notice if the capture died."""
@@ -684,8 +898,9 @@ class App:
         if not self.demo and not self.capture.running():
             tail = self.capture.log_tail()
             self.cap_status.configure(text="capture process exited", foreground=C["bad"])
-            self.btn_cap.configure(state="normal")
             self._cap_start = None
+            self._cancel("autoverify")
+            self._refresh_action_states()
             if tail:
                 self.log("airodump (capture) said:\n" + tail)
             return
@@ -693,45 +908,62 @@ class App:
         state = "handshake captured" if self._hs_ok else "waiting for handshake - send a deauth"
         self.cap_status.configure(text=f"{elapsed // 60:02d}:{elapsed % 60:02d}  {state}",
                                   foreground=C["good"] if self._hs_ok else C["muted"])
-        self.root.after(1000, self._capture_tick)
+        self._refresh_action_states()   # Save enables once the .cap file appears
+        self._schedule("captick", CAPTURE_TICK_MS, self._capture_tick)
 
     def on_deauth(self) -> None:
         if not self.capture:
             messagebox.showinfo("Deauth", "Start a capture first, then send deauth.")
             return
-        client = None if self.bcast_var.get() else self._selected_client()
-        if client is None and not self.bcast_var.get():
+        if not self.demo and not self.capture.running():
+            messagebox.showinfo("Deauth", "The capture isn't running — (re)start the capture first.")
+            return
+        broadcast = self.bcast_var.get()
+        client = None if broadcast else self._selected_client()
+        if broadcast:
+            if not messagebox.askyesno("Deauth", "Broadcast deauth disconnects EVERY client on this AP, "
+                                                 "not just one.\n\nProceed?"):
+                return
+        elif client is None:
             if not messagebox.askyesno("Deauth", "No specific client selected. Broadcast deauth to the AP?"):
                 return
-        count = max(1, int(self.deauth_count.get()))
+        count = self._deauth_count()
         cap = self.capture
 
         def work():
-            cap.deauth(client=client, count=count)
-            return True
-        self._run_async(work)
+            return cap.deauth(client=client, count=count)
+
+        def done(res):
+            if res is not None and not getattr(res, "ok", True):
+                last = (res.text().strip().splitlines() or ["see log"])[-1]
+                self.log("Deauth may not have been sent: " + last)
+        self._run_async(work, done)
 
     def on_verify(self) -> None:
-        if not self.capture:
+        if not self.capture or self._verify_busy:
             return
-        cap = self.capture
-        self._run_async(lambda: cap.has_handshake(), self._set_handshake)
+        self._verify_busy = True
+        cap, gen = self.capture, self._cap_gen
+
+        def done(ok):
+            self._verify_busy = False
+            if gen == self._cap_gen:      # ignore a result from a prior target
+                self._set_handshake(ok)
+        self._run_async(lambda: cap.has_handshake(quiet=False), done)
 
     def _auto_verify(self) -> None:
         if not self.capture or not self.capture.running():
             return
         if not self._verify_busy:
             self._verify_busy = True
-            cap = self.capture
-
-            def work():
-                return cap.has_handshake()
+            cap, gen = self.capture, self._cap_gen
 
             def done(ok):
                 self._verify_busy = False
-                self._set_handshake(ok)
-            self._run_async(work, done)
-        self.root.after(AUTOVERIFY_MS, self._auto_verify)
+                if gen == self._cap_gen:
+                    self._set_handshake(ok)
+            self._run_async(lambda: cap.has_handshake(quiet=True), done)
+        self._schedule("autoverify", AUTOVERIFY_MS, self._auto_verify)
 
     def _set_handshake(self, ok: bool) -> None:
         # Once captured, stay captured for this session even if a later re-verify
@@ -744,6 +976,7 @@ class App:
                 self.log(f"Handshake captured -> {path}")
         elif not ok and not self._hs_ok:
             self.hs_lbl.configure(text="  HANDSHAKE: not captured  ", bg=C["sel"], fg=C["fg"])
+        self._refresh_action_states()
 
     # ---------------------------------------------------------------- PMKID
     def on_pmkid_start(self) -> None:
@@ -758,12 +991,24 @@ class App:
         if not ap:
             messagebox.showinfo("PMKID", "Select a target network in the scan table first.")
             return
+        if not ap.is_capturable() and not self.demo:
+            note = ap.security_note() or "no WPA-PSK PMKID to capture"
+            if not messagebox.askyesno("PMKID", f"{ap.essid}: {note}\n\nStart PMKID capture anyway?"):
+                return
+        if not is_valid_channel(ap.channel) and not self.demo:
+            messagebox.showwarning("PMKID", f"'{ap.essid}' has no usable channel ({ap.channel!r}).")
+            return
+        if not self._adapter_can_reach(ap.channel) and not self.demo:
+            messagebox.showwarning("PMKID", f"'{ap.essid}' is 5 GHz but the adapter is 2.4 GHz-only.")
+            return
+        if not self.demo and not pmkid_detection_available():
+            if not messagebox.askyesno("PMKID", "hcxpcapngtool (from hcxtools) is not installed, so a "
+                                                "captured PMKID can't be auto-detected or exported.\n\n"
+                                                "Capture anyway?"):
+                return
         if self.scan and self.scan.running():
             self._stop_scan("Scan stopped so PMKID capture can pin the channel.")
-        try:
-            os.makedirs(self.out_dir, exist_ok=True)
-        except OSError as e:
-            messagebox.showerror("PMKID", f"Can't create output folder:\n{e}")
+        if not self._ensure_out_dir():
             return
         target = CaptureTarget(bssid=ap.bssid, channel=ap.channel, essid=ap.essid)
         cls = DemoPmkidSession if self.demo else PmkidSession
@@ -772,43 +1017,56 @@ class App:
         if not self.demo and not self.pmkid.running():
             tail = self.pmkid.log_tail()
             self.pmkid = None
-            messagebox.showerror("PMKID", "hcxdumptool failed to start (is it installed? see log).")
+            messagebox.showerror("PMKID", "hcxdumptool did not start — it may be missing, a version "
+                                          "mismatch, or want the base interface. See the log.")
             if tail:
                 self.log(tail)
+            self._refresh_action_states()
             return
+        self._pmkid_gen += 1
         self._pmkid_ok = False
+        self._pmkid_busy = False
         self._set_pmkid(False)
         self._pmkid_start = time.time()
-        self.btn_pmkid.configure(state="disabled")
-        self.root.after(AUTOVERIFY_MS, self._auto_pmkid)
-        self.root.after(1000, self._pmkid_tick)
+        self._refresh_action_states()
+        self._schedule("autopmkid", AUTOVERIFY_MS, self._auto_pmkid)
+        self._schedule("pmkidtick", CAPTURE_TICK_MS, self._pmkid_tick)
 
     def on_pmkid_stop(self) -> None:
+        self._cancel("pmkidtick")
+        self._cancel("autopmkid")
         if self.pmkid:
             self.pmkid.stop()
             self.log("PMKID capture stopped.")
         self._pmkid_start = None
-        self.btn_pmkid.configure(state="normal")
         self.pmkid_status.configure(text="")
+        self._refresh_action_states()
 
     def on_pmkid_check(self) -> None:
-        if not self.pmkid:
+        if not self.pmkid or self._pmkid_busy:
             return
-        pm = self.pmkid
-        self._run_async(lambda: pm.check_pmkid(), self._set_pmkid)
+        self._pmkid_busy = True
+        pm, gen = self.pmkid, self._pmkid_gen
+
+        def done(ok):
+            self._pmkid_busy = False
+            if gen == self._pmkid_gen:
+                self._set_pmkid(ok)
+        self._run_async(lambda: pm.check_pmkid(quiet=False), done)
 
     def _auto_pmkid(self) -> None:
         if not self.pmkid or not self.pmkid.running():
             return
         if not self._pmkid_busy:
             self._pmkid_busy = True
-            pm = self.pmkid
+            pm, gen = self.pmkid, self._pmkid_gen
 
             def done(ok):
                 self._pmkid_busy = False
-                self._set_pmkid(ok)
-            self._run_async(lambda: pm.check_pmkid(), done)
-        self.root.after(AUTOVERIFY_MS, self._auto_pmkid)
+                if gen == self._pmkid_gen:
+                    self._set_pmkid(ok)
+            self._run_async(lambda: pm.check_pmkid(quiet=True), done)
+        self._schedule("autopmkid", AUTOVERIFY_MS, self._auto_pmkid)
 
     def _pmkid_tick(self) -> None:
         if not self.pmkid or self._pmkid_start is None:
@@ -816,8 +1074,9 @@ class App:
         if not self.demo and not self.pmkid.running():
             tail = self.pmkid.log_tail()
             self.pmkid_status.configure(text="hcxdumptool exited", foreground=C["bad"])
-            self.btn_pmkid.configure(state="normal")
             self._pmkid_start = None
+            self._cancel("autopmkid")
+            self._refresh_action_states()
             if tail:
                 self.log("hcxdumptool said:\n" + tail)
             return
@@ -825,7 +1084,7 @@ class App:
         state = "PMKID captured" if self._pmkid_ok else "listening for PMKID..."
         self.pmkid_status.configure(text=f"{elapsed // 60:02d}:{elapsed % 60:02d}  {state}",
                                     foreground=C["good"] if self._pmkid_ok else C["muted"])
-        self.root.after(1000, self._pmkid_tick)
+        self._schedule("pmkidtick", CAPTURE_TICK_MS, self._pmkid_tick)
 
     def _set_pmkid(self, ok: bool) -> None:
         if ok and not self._pmkid_ok:
@@ -836,6 +1095,7 @@ class App:
                 self.log(f"PMKID captured -> {path}")
         elif not ok and not self._pmkid_ok:
             self.pmkid_lbl.configure(text="  PMKID: not captured  ", bg=C["sel"], fg=C["fg"])
+        self._refresh_action_states()
 
     def on_pmkid_export(self) -> None:
         if not self.pmkid:
@@ -894,15 +1154,36 @@ class App:
             return False
         return True
 
-    def _set_capture_enabled(self, on: bool) -> None:
-        state = "normal" if on else "disabled"
-        for b in (self.btn_scan, self.btn_cap, self.btn_deauth, self.btn_verify,
-                  self.btn_capstop, self.btn_savecap, self.btn_export, self.btn_inject,
-                  self.btn_pmkid, self.btn_pmkid_stop, self.btn_pmkid_check, self.btn_pmkid_export,
-                  self.btn_macrand, self.btn_macrestore):
-            b.configure(state=state)
+    def _refresh_action_states(self) -> None:
+        """Enable each control only when it can actually do something, so nothing
+        is a live no-op and the radio is never asked to do two jobs at once."""
+        mon = bool(self.mon_iface)
+        cap = self.capture is not None
+        cap_run = cap and self.capture.running()
+        pm = self.pmkid is not None
+        pm_run = pm and self.pmkid.running()
+        cap_has_file = cap and bool(self.capture.cap_file())
+        idle = not cap_run and not pm_run
+
+        def en(btn, cond):
+            btn.configure(state="normal" if cond else "disabled")
+
+        en(self.btn_scan, mon and not cap_run and not pm_run)
+        en(self.btn_inject, mon and idle)
+        en(self.btn_cap, mon and idle)
+        en(self.btn_deauth, cap_run)
+        en(self.btn_verify, cap)
+        en(self.btn_capstop, cap_run)
+        en(self.btn_savecap, cap_has_file or (self.demo and cap))
+        en(self.btn_export, self._hs_ok or (self.demo and cap))
+        en(self.btn_pmkid, mon and idle)
+        en(self.btn_pmkid_stop, pm_run)
+        en(self.btn_pmkid_check, pm)
+        en(self.btn_pmkid_export, self._pmkid_ok or (self.demo and pm))
+        self._update_mac_buttons()
 
     def _stop_all(self) -> None:
+        self._cancel_all_timers()
         self._stop_scan()
         if self.capture:
             self.capture.stop()
@@ -912,6 +1193,15 @@ class App:
             self.pmkid = None
         self._cap_start = None
         self._pmkid_start = None
+        # Reset the indicators + statuses so nothing stale (a stuck "CAPTURED"
+        # light, an enabled Export) survives Restore networking.
+        self._hs_ok = False
+        self._pmkid_ok = False
+        self.hs_lbl.configure(text="  HANDSHAKE: not captured  ", bg=C["sel"], fg=C["fg"])
+        self.pmkid_lbl.configure(text="  PMKID: not captured  ", bg=C["sel"], fg=C["fg"])
+        self.cap_status.configure(text="")
+        self.pmkid_status.configure(text="")
+        self._refresh_action_states()
 
     def on_close(self) -> None:
         self._stop_all()
@@ -919,8 +1209,13 @@ class App:
             if messagebox.askyesno("Quit", "Restore networking (disable monitor mode) before quitting?"):
                 try:
                     disable_monitor(self.mon_iface, log=self.log)
-                except Exception:
-                    pass
+                except Exception as e:
+                    self.log(f"Restore on quit failed: {e}")
+        if self._log_fh:
+            try:
+                self._log_fh.close()
+            except OSError:
+                pass
         self.root.destroy()
 
 

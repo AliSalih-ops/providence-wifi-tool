@@ -31,8 +31,10 @@ AB:CD:EF:12:34:56, 2026-09-22 10:03:00, 2026-09-22 10:05:00, -80,       20, (not
 
 def demo_interfaces() -> List[Interface]:
     return [
-        Interface(name="wlan0", phy="phy0", driver="mt76x2u", mode="managed", supports_monitor=True),
-        Interface(name="wlan1", phy="phy1", driver="iwlwifi", mode="managed", supports_monitor=False),
+        Interface(name="wlan0", phy="phy0", driver="mt76x2u", mode="managed",
+                  supports_monitor=True, bands=("2.4", "5")),
+        Interface(name="wlan1", phy="phy1", driver="iwlwifi", mode="managed",
+                  supports_monitor=False, bands=("2.4",)),
     ]
 
 
@@ -103,7 +105,7 @@ class DemoCaptureSession:
                 return "[demo] frames sent"
         return _R()
 
-    def has_handshake(self) -> bool:
+    def has_handshake(self, quiet: bool = False) -> bool:
         return self._deauthed  # pretend the deauth caught a reconnect
 
     def export_22000(self) -> Optional[str]:
@@ -142,10 +144,10 @@ class DemoPmkidSession:
     def export_22000(self) -> Optional[str]:
         return "/tmp/demo_pmkid.22000"
 
-    def check_pmkid(self) -> bool:
+    def check_pmkid(self, quiet: bool = False) -> bool:
         # Pretend it takes a couple of polls to see a PMKID.
         self._checks += 1
         got = self._checks >= 2
-        if self.log:
+        if self.log and not quiet:
             self.log("[demo] PMKID captured." if got else "[demo] No PMKID yet.")
         return got

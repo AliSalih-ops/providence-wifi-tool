@@ -19,9 +19,15 @@ import re
 import subprocess
 import tempfile
 from dataclasses import dataclass
-from typing import List, Optional
+from datetime import datetime
+from typing import Optional
 
-from .util import CmdResult, LogFn, run, spawn, terminate, which
+from .util import CmdResult, LogFn, is_mac, run, spawn, terminate, which
+
+
+def _stamp() -> str:
+    """A filename-safe timestamp so re-running against one AP never overwrites."""
+    return datetime.now().strftime("%Y%m%d-%H%M%S")
 
 
 @dataclass
@@ -46,11 +52,16 @@ def safe_prefix(out_dir: str, essid: str, bssid: str) -> str:
 
 
 def capture_argv(mon_iface: str, bssid: str, channel: str, prefix: str) -> list:
-    """airodump-ng argv for a capture pinned to one AP's channel + BSSID."""
+    """airodump-ng argv for a capture pinned to one AP's channel + BSSID.
+
+    `--output-format pcap` keeps airodump from also spewing .csv/.kismet.csv/
+    .kismet.netxml/.log.csv beside every capture.
+    """
     return [
         "airodump-ng",
         "--bssid", bssid,
         "-c", str(channel),
+        "--output-format", "pcap",
         "-w", prefix,
         mon_iface,
     ]
@@ -89,13 +100,18 @@ class CaptureSession:
         self._proc: Optional[subprocess.Popen] = None
         self._logfh = None
         self._logpath: Optional[str] = None
-        self.out_dir = out_dir or tempfile.mkdtemp(prefix="wifiaudit-cap-")
+        self.out_dir = out_dir or tempfile.mkdtemp(prefix="providence-cap-")
         os.makedirs(self.out_dir, exist_ok=True)
-        self.prefix = safe_prefix(self.out_dir, target.essid, target.bssid)
+        self.prefix = safe_prefix(self.out_dir, target.essid, target.bssid) + "_" + _stamp()
 
     # -- capture -----------------------------------------------------------
     def start(self) -> None:
         """Begin capturing, locked to the target's channel and BSSID."""
+        if not is_mac(self.target.bssid) or not is_valid_channel(self.target.channel):
+            if self.log:
+                self.log(f"Refusing capture: bad target {self.target.bssid!r} / channel "
+                         f"{self.target.channel!r}")
+            return
         self._logpath = self.prefix + ".airodump.log"
         self._logfh = open(self._logpath, "w")
         self._proc = spawn(
@@ -128,9 +144,11 @@ class CaptureSession:
             return ""
 
     def cap_file(self) -> Optional[str]:
-        """Newest .cap file this session has produced."""
-        files = sorted(glob.glob(self.prefix + "*.cap"))
-        return files[-1] if files else None
+        """Newest .cap file this session has produced (by mtime, not name)."""
+        files = glob.glob(self.prefix + "*.cap")
+        if not files:
+            return None
+        return max(files, key=lambda p: os.path.getmtime(p))
 
     # -- deauth ------------------------------------------------------------
     def deauth(self, client: Optional[str] = None, count: int = 5) -> CmdResult:
@@ -141,17 +159,26 @@ class CaptureSession:
         the AP. `count` frames are sent and aireplay exits (count=0 would loop
         forever — intentionally not the default).
         """
+        if not is_mac(self.target.bssid):
+            return CmdResult(["aireplay-ng"], 2, "", f"refusing deauth: bad BSSID {self.target.bssid!r}",
+                             0.0, 0.0)
+        if client and not is_mac(client):
+            if self.log:
+                self.log(f"Ignoring malformed client MAC {client!r}; broadcasting instead.")
+            client = None
         who = client or "broadcast"
         if self.log:
             self.log(f"Deauth x{count} at {who} on {self.target.bssid}")
         return run(deauth_argv(self.mon_iface, self.target.bssid, client, count), timeout=30, log=self.log)
 
     # -- verify ------------------------------------------------------------
-    def has_handshake(self) -> bool:
+    def has_handshake(self, quiet: bool = False) -> bool:
         cap = self.cap_file()
         if not cap:
             return False
-        return verify_handshake(cap, self.target.bssid, log=self.log)
+        # quiet=True (used by the 5s auto-poll) suppresses the per-check command
+        # + result spam so the activity log doesn't fill with routine polls.
+        return verify_handshake(cap, self.target.bssid, log=(None if quiet else self.log))
 
     # -- export ------------------------------------------------------------
     def export_22000(self) -> Optional[str]:
@@ -164,8 +191,9 @@ class CaptureSession:
 def _scan_handshake_text(text: str, bssid: str = "") -> bool:
     """Pure parser: does aircrack-ng's output claim a handshake?
 
-    aircrack lists each network with a "(N handshake)" marker. We treat any
-    N>=1 as success (preferring a row that also names the target BSSID).
+    aircrack lists each network with a "(N handshake)" marker. Any N>=1 counts;
+    when a target BSSID is given the marker must be on that BSSID's row, so a
+    handshake for a different network in the same .cap isn't a false positive.
     """
     for line in text.splitlines():
         low = line.lower()
@@ -198,12 +226,42 @@ def verify_handshake(cap_file: str, bssid: str = "", log: Optional[LogFn] = None
     return found
 
 
-def export_hashcat(cap_file: str, out_file: Optional[str] = None, log: Optional[LogFn] = None) -> Optional[str]:
-    """Convert a .cap to hashcat's 22000 format via hcxpcapngtool.
+def _scope_22000_file(path: str, bssid: str) -> None:
+    """Rewrite a 22000 file keeping only lines whose AP MAC is `bssid`.
 
-    Returns the output path on success, else None. This is the modern hand-off
-    for offline cracking with hashcat; it's optional and only runs if the tool
-    is installed.
+    A PMKID/EAPOL 22000 line is WPA*NN*<hash>*<ap-mac>*<sta-mac>*... — field 3
+    is the AP MAC. Passive capture can pick up co-channel neighbours, so we drop
+    anything not for the authorized target before it's handed off. Empty result
+    removes the file.
+    """
+    target = bssid.replace(":", "").lower()
+    try:
+        with open(path, "r", errors="replace") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return
+    kept = []
+    for line in lines:
+        parts = line.split("*")
+        if line.startswith("WPA*") and len(parts) >= 4 and parts[3].lower() != target:
+            continue
+        if line.strip():
+            kept.append(line)
+    if kept:
+        with open(path, "w") as f:
+            f.write("\n".join(kept) + "\n")
+    elif os.path.exists(path):
+        os.remove(path)
+
+
+def export_hashcat(cap_file: str, out_file: Optional[str] = None, log: Optional[LogFn] = None,
+                   bssid: str = "") -> Optional[str]:
+    """Convert a .cap/.pcapng to hashcat's 22000 format via hcxpcapngtool.
+
+    Returns the output path on success, else None. If `bssid` is given, the
+    result is scoped to that AP's rows (used for PMKID, whose raw pcapng may hold
+    co-channel neighbours; the airodump .cap is already BSSID-scoped so callers
+    leave bssid empty there).
     """
     if which("hcxpcapngtool") is None:
         if log:
@@ -214,32 +272,78 @@ def export_hashcat(cap_file: str, out_file: Optional[str] = None, log: Optional[
     out_file = out_file or (os.path.splitext(cap_file)[0] + ".22000")
     res = run(["hcxpcapngtool", "-o", out_file, cap_file], timeout=60, log=log)
     if res.ok and os.path.exists(out_file) and os.path.getsize(out_file) > 0:
+        if bssid:
+            _scope_22000_file(out_file, bssid)
+        if os.path.exists(out_file) and os.path.getsize(out_file) > 0:
+            if log:
+                log(f"Exported hashcat 22000: {out_file}")
+            return out_file
         if log:
-            log(f"Exported hashcat 22000: {out_file}")
-        return out_file
+            log("No in-scope hashes for the target BSSID.")
+        return None
     if log:
         log("Export produced no usable hashes (handshake may be incomplete).")
     return None
 
 
 # ----------------------------------------------------------------- PMKID
-def hcxdumptool_argv(iface: str, out_pcapng: str, channel: Optional[str] = None) -> list:
+def hcxdumptool_version(log: Optional[LogFn] = None) -> Optional[tuple]:
+    """Return the installed hcxdumptool (major, minor), or None if absent/unknown.
+
+    The 6.3.0 rewrite (shipping in current Kali) removed the --filterlist_ap /
+    --filtermode attack-filter interface, so we must know the version before
+    building the command or it exits on an unrecognized option.
+    """
+    if which("hcxdumptool") is None:
+        return None
+    res = run(["hcxdumptool", "--version"], timeout=10, log=None)
+    m = re.search(r"(\d+)\.(\d+)", res.text())
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+def pmkid_detection_available() -> bool:
+    """PMKID success is detected by converting with hcxpcapngtool; without it we
+    can capture but never see a green light or export."""
+    return which("hcxpcapngtool") is not None
+
+
+def hcxdumptool_argv(iface: str, out_pcapng: str, channel: Optional[str] = None,
+                     filter_file: Optional[str] = None, version: Optional[tuple] = None) -> list:
     """Build an hcxdumptool command for clientless (PMKID) capture.
 
-    NOTE: hcxdumptool's CLI has changed across major versions. `-i` (interface)
-    and `-w` (pcapng output) are stable; channel pinning (`-c`) exists on 6.3+.
-    The exact command is always echoed to the log so it can be adjusted if your
-    installed version differs.
+    `--filterlist_ap`/`--filtermode` (target whitelist) exist ONLY on the
+    6.0–6.2 line; 6.3+ removed them (an unknown option makes hcxdumptool exit).
+    So those flags are added only when the detected `version` is <= 6.2. On 6.3+
+    (or unknown) we omit them and rely on target-scoped detection + export
+    instead, so nothing out-of-scope is ever reported or handed off. The exact
+    command is echoed to the log so it can be adjusted per installed version.
     """
     argv = ["hcxdumptool", "-i", iface, "-w", out_pcapng]
     if channel:
         argv += ["-c", str(channel)]
+    if filter_file and version is not None and version < (6, 3):
+        argv += ["--filterlist_ap=" + filter_file, "--filtermode=2"]
     return argv
 
 
 def pmkid_from_22000(text: str) -> bool:
     """hcxpcapngtool writes 22000 lines: WPA*01* = PMKID, WPA*02* = EAPOL."""
     return "WPA*01*" in text
+
+
+def pmkid_for_bssid(text: str, bssid: str = "") -> bool:
+    """True if a PMKID line (WPA*01*<pmkid>*<ap-mac>*...) is for `bssid`.
+
+    Scopes success detection to the authorized target so a co-channel
+    neighbour's PMKID isn't reported as ours. Empty bssid = any PMKID.
+    """
+    target = bssid.replace(":", "").lower()
+    for line in text.splitlines():
+        if line.startswith("WPA*01*"):
+            parts = line.split("*")
+            if len(parts) >= 4 and (not target or parts[3].lower() == target):
+                return True
+    return False
 
 
 def hash_kinds(text: str) -> set:
@@ -267,18 +371,40 @@ class PmkidSession:
         self._proc: Optional[subprocess.Popen] = None
         self._logfh = None
         self._logpath: Optional[str] = None
-        self.out_dir = out_dir or tempfile.mkdtemp(prefix="wifiaudit-pmkid-")
+        self.out_dir = out_dir or tempfile.mkdtemp(prefix="providence-pmkid-")
         os.makedirs(self.out_dir, exist_ok=True)
-        self.pcapng = safe_prefix(self.out_dir, target.essid, target.bssid) + ".pcapng"
+        base = safe_prefix(self.out_dir, target.essid, target.bssid) + "_" + _stamp()
+        self.pcapng = base + ".pcapng"
+        self._filter_file = base + ".filter"
 
     def start(self) -> None:
+        # Scope enforcement: never run PMKID capture unscoped (it would probe
+        # every AP on the channel, outside the authorized target).
+        if not is_mac(self.target.bssid):
+            if self.log:
+                self.log(f"Refusing PMKID capture: no valid target BSSID ({self.target.bssid!r}).")
+            return
+        try:
+            with open(self._filter_file, "w") as f:
+                f.write(self.target.bssid.replace(":", "").lower() + "\n")
+        except OSError as e:
+            if self.log:
+                self.log(f"Could not write PMKID target filter: {e}")
+            return
         self._logpath = self.pcapng + ".log"
         self._logfh = open(self._logpath, "w")
         chan = self.target.channel if is_valid_channel(self.target.channel) else None
-        self._proc = spawn(hcxdumptool_argv(self.mon_iface, self.pcapng, chan),
+        ver = hcxdumptool_version(log=self.log)
+        self._proc = spawn(hcxdumptool_argv(self.mon_iface, self.pcapng, chan, self._filter_file, ver),
                            log=self.log, out=self._logfh)
         if self.log:
-            self.log(f"PMKID capture on {self.mon_iface} -> {os.path.basename(self.pcapng)}")
+            vtxt = f"{ver[0]}.{ver[1]}" if ver else "unknown"
+            self.log(f"PMKID capture on {self.mon_iface} (hcxdumptool {vtxt}) targeting "
+                     f"{self.target.bssid} -> {os.path.basename(self.pcapng)}")
+            if ver is None or ver >= (6, 3):
+                self.log("  note: 6.3+ dropped RF BSSID-filtering; capture is scoped by "
+                         "detection + export to the target, and if it errors on the interface, "
+                         "hand hcxdumptool the base (managed) interface instead of the monitor VIF.")
 
     def running(self) -> bool:
         return self._proc is not None and self._proc.poll() is None
@@ -306,11 +432,16 @@ class PmkidSession:
         return self.pcapng if os.path.exists(self.pcapng) else None
 
     def export_22000(self) -> Optional[str]:
-        return export_hashcat(self.pcapng, log=self.log) if os.path.exists(self.pcapng) else None
+        if not os.path.exists(self.pcapng):
+            return None
+        return export_hashcat(self.pcapng, log=self.log, bssid=self.target.bssid)
 
-    def check_pmkid(self) -> bool:
-        """Convert the pcapng and report whether a PMKID was captured."""
-        out = self.export_22000()
+    def check_pmkid(self, quiet: bool = False) -> bool:
+        """Convert the pcapng and report whether a PMKID was captured for the
+        target BSSID. quiet=True (auto-poll) suppresses routine log spam."""
+        log = None if quiet else self.log
+        out = (export_hashcat(self.pcapng, log=log, bssid=self.target.bssid)
+               if os.path.exists(self.pcapng) else None)
         if not out:
             return False
         try:
@@ -318,7 +449,7 @@ class PmkidSession:
                 text = f.read()
         except OSError:
             return False
-        found = pmkid_from_22000(text)
-        if self.log:
+        found = pmkid_for_bssid(text, self.target.bssid)
+        if not quiet and self.log:
             self.log("PMKID captured." if found else "No PMKID yet.")
         return found

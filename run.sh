@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Launcher for WiFi Audit GUI.
+# Launcher for pr0v1dence WiFi Tool.
 #
 #   ./run.sh          -> launch the GUI (asks for sudo, needs it for radio work)
 #   ./run.sh --demo   -> launch with simulated data, no radio, no root
@@ -27,7 +27,7 @@ fi
 
 if [[ "$needs_root" -eq 1 && "${EUID:-$(id -u)}" -ne 0 ]]; then
   echo "Radio actions need root; re-launching with sudo..."
-  exec sudo -E python3 -m wifiaudit "$@"
+  exec sudo -E python3 -m providence "$@"
 fi
 
-exec python3 -m wifiaudit "$@"
+exec python3 -m providence "$@"

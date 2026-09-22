@@ -1,6 +1,6 @@
 """Offline logic tests - no GUI, no radio, no root.
 
-Run with:  python3 -m wifiaudit --selftest
+Run with:  python3 -m providence --selftest
 These exercise the pure parsing/flow logic (the parts that don't touch hardware)
 so the app can be sanity-checked on any machine, including the dev box.
 """
@@ -8,15 +8,19 @@ so the app can be sanity-checked on any machine, including the dev box.
 from __future__ import annotations
 
 import os
+import tempfile
 
 from .capture import (
+    CaptureSession,
     CaptureTarget,
     _scan_handshake_text,
+    _scope_22000_file,
     capture_argv,
     deauth_argv,
     hash_kinds,
     hcxdumptool_argv,
     is_valid_channel,
+    pmkid_for_bssid,
     pmkid_from_22000,
     safe_prefix,
 )
@@ -27,8 +31,9 @@ from .demo import (
     DemoScanSession,
     demo_interfaces,
 )
-from .iface import _parse_iw_dev, _parse_new_mac, _supported_modes, macchanger_argv
-from .scan import airodump_band, parse_csv, scan_argv
+from .iface import _parse_iw_dev, _parse_new_mac, _supported_bands, _supported_modes, macchanger_argv
+from .scan import AccessPoint, airodump_band, parse_csv, scan_argv
+from .util import is_mac
 
 
 IW_DEV_SAMPLE = """\
@@ -201,6 +206,85 @@ def run() -> int:
               "New MAC:       12:34:56:78:9a:bc (unknown)\n")
     c.eq("parse new MAC", _parse_new_mac(macout), "12:34:56:78:9a:bc")
     c.eq("parse new MAC when absent", _parse_new_mac("no macs here"), "")
+
+    print("== encryption classification ==")
+
+    def ap(priv, auth):
+        return AccessPoint("AA:BB:CC:11:22:33", "6", priv, "CCMP", auth, "-40", "10", "Net")
+
+    c.ok("WPA2-PSK capturable", ap("WPA2", "PSK").is_capturable())
+    c.ok("WPA/WPA2 capturable", ap("WPA2 WPA", "PSK").is_capturable())
+    c.ok("WPA2/WPA3 transition capturable", ap("WPA2 WPA3", "PSK SAE").is_capturable())
+    c.ok("WPA3-SAE NOT capturable", not ap("WPA3", "SAE").is_capturable())
+    c.ok("WPA3-SAE flagged sae_only", ap("WPA3", "SAE").is_sae_only())
+    c.ok("enterprise (MGT) NOT capturable", not ap("WPA2", "MGT").is_capturable())
+    c.ok("WEP NOT capturable", not ap("WEP", "").is_capturable())
+    c.ok("open NOT capturable", not ap("OPN", "").is_capturable())
+    c.ok("OWE NOT capturable", not ap("OWE", "").is_capturable())
+    c.ok("WPA3 note mentions SAE", "SAE" in ap("WPA3", "SAE").security_note())
+    c.eq("capturable note is empty", ap("WPA2", "PSK").security_note(), "")
+
+    print("== MAC validation (arg-injection guard) ==")
+    c.ok("valid mac", is_mac("aa:bb:cc:dd:ee:ff"))
+    c.ok("valid upper", is_mac("AA:BB:CC:11:22:33"))
+    c.ok("reject short", not is_mac("aa:bb:cc"))
+    c.ok("reject flag-like token", not is_mac("-a:bb:cc:dd:ee:ff"))
+    c.ok("reject empty", not is_mac(""))
+    c.ok("reject spaces", not is_mac("aa bb cc dd ee ff"))
+    c.ok("reject trailing junk", not is_mac("aa:bb:cc:dd:ee:ff;rm"))
+
+    print("== PMKID scoping ==")
+    line = "WPA*01*deadbeefdeadbeefdeadbeefdeadbeef*aabbcc112233*445566778899*4d794e6574***"
+    c.ok("pmkid matches target bssid", pmkid_for_bssid(line, "AA:BB:CC:11:22:33"))
+    c.ok("pmkid rejects other bssid", not pmkid_for_bssid(line, "FF:FF:FF:FF:FF:FF"))
+    c.ok("pmkid any when untargeted", pmkid_for_bssid(line, ""))
+    c.ok("eapol line is not a pmkid", not pmkid_for_bssid("WPA*02*whatever", "AA:BB:CC:11:22:33"))
+    hv62 = hcxdumptool_argv("wlan0mon", "/tmp/x.pcapng", "6", "/tmp/f", (6, 2))
+    c.ok("hcxdumptool 6.2 adds filter flags", any("filterlist_ap" in a for a in hv62) and "--filtermode=2" in hv62)
+    hv63 = hcxdumptool_argv("wlan0mon", "/tmp/x.pcapng", "6", "/tmp/f", (6, 3))
+    c.ok("hcxdumptool 6.3 omits removed filter flags (would crash)", not any("filterlist" in a for a in hv63))
+    c.ok("hcxdumptool unknown-version fail-safe omits flags",
+         not any("filterlist" in a for a in hcxdumptool_argv("wlan0mon", "/tmp/x.pcapng", "6", "/tmp/f")))
+    # export scoping: only the target AP's 22000 rows are kept
+    tmp2 = tempfile.mkdtemp(prefix="providence-22000-")
+    p22 = os.path.join(tmp2, "x.22000")
+    with open(p22, "w") as f:
+        f.write("WPA*01*aaaa*aabbcc112233*111111111111*4e*\n")   # target AP
+        f.write("WPA*01*bbbb*ffffffffffff*222222222222*4e*\n")   # neighbour
+    _scope_22000_file(p22, "AA:BB:CC:11:22:33")
+    kept = open(p22).read()
+    c.ok("export keeps target AP rows", "aabbcc112233" in kept)
+    c.ok("export drops neighbour AP rows", "ffffffffffff" not in kept)
+    import shutil as _sh2
+    _sh2.rmtree(tmp2, ignore_errors=True)
+
+    print("== adapter band detection ==")
+    info_dual = "\t\t* 2412 MHz [1]\n\t\t* 5180 MHz [36]\n"
+    info_24 = "\t\t* 2412.0 MHz [1]\n\t\t* 2437 MHz [6]\n"
+    c.eq("dual-band phy -> {2.4,5}", _supported_bands(info_dual), {"2.4", "5"})
+    c.eq("2.4-only phy -> {2.4}", _supported_bands(info_24), {"2.4"})
+
+    print("== 5GHz channels + CRLF-safe parsing + output-format ==")
+    c.ok("5GHz ch 149 valid", is_valid_channel("149"))
+    c.ok("5GHz ch 165 valid", is_valid_channel("165"))
+    crlf = SAMPLE_CSV.replace("ACME-Corp", "AC\rME")   # lone CR inside an ESSID
+    aps_c, _ = parse_csv(crlf)
+    c.eq("CR in ESSID adds no phantom rows", len(aps_c), 3)
+    c.ok("CR stripped from parsed ESSID", "\r" not in aps_c[0].essid)
+    cv2 = capture_argv("wlan0mon", "AA:BB:CC:11:22:33", "6", "/tmp/cap")
+    c.ok("capture limits airodump output format", "pcap" in cv2 and "--output-format" in cv2)
+
+    print("== newest capture file by mtime (not lexicographic) ==")
+    tmp = tempfile.mkdtemp(prefix="providence-test-")
+    cs = CaptureSession("wlan0mon", CaptureTarget("AA:BB:CC:11:22:33", "6", "Net"), out_dir=tmp)
+    older, newer = cs.prefix + "-09.cap", cs.prefix + "-10.cap"
+    open(older, "w").close()
+    open(newer, "w").close()
+    os.utime(older, (2000, 2000))
+    os.utime(newer, (3000, 3000))          # -10 is newer despite sorting before -09
+    c.eq("cap_file picks newest by mtime", os.path.basename(cs.cap_file()), os.path.basename(newer))
+    import shutil as _sh
+    _sh.rmtree(tmp, ignore_errors=True)
 
     print("== demo interfaces & flow ==")
     di = demo_interfaces()

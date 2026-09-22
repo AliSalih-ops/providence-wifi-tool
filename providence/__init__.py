@@ -1,4 +1,4 @@
-"""WiFi Audit GUI - an authorized-pentest handshake capture toolkit.
+"""pr0v1dence WiFi Tool - an authorized-pentest handshake capture toolkit.
 
 A single graphical front-end over the standard aircrack-ng suite that walks the
 whole WPA/WPA2 handshake-capture workflow:
@@ -12,5 +12,5 @@ novel attack technique; it just removes the repetitive multi-terminal juggling.
 Only use it against networks you are explicitly authorized to test.
 """
 
-__version__ = "0.1.0"
-__app_name__ = "WiFi Audit GUI"
+__version__ = "1.0.0"
+__app_name__ = "pr0v1dence WiFi Tool"

@@ -1,4 +1,4 @@
-# WiFi Audit GUI has NO Python package dependencies - it uses only the standard
+# pr0v1dence WiFi Tool has NO Python package dependencies - it uses only the standard
 # library (tkinter) plus external CLI tools you install with apt.
 #
 # System prerequisites (Kali/Debian):
