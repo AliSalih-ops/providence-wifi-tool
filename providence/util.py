@@ -141,18 +141,6 @@ def terminate(proc: Optional[subprocess.Popen], log: Optional[LogFn] = None) -> 
 _MAC_RE = re.compile(r"^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$")
 
 
-def reown(path: str) -> None:
-    """When running under sudo, give a path back to the invoking user so the
-    operator's captures/logs in their home aren't left root-owned (best-effort)."""
-    uid = os.environ.get("SUDO_UID")
-    gid = os.environ.get("SUDO_GID")
-    if uid and hasattr(os, "chown"):
-        try:
-            os.chown(path, int(uid), int(gid) if gid else -1)
-        except OSError:
-            pass
-
-
 def is_mac(value: str) -> bool:
     """True if `value` is a well-formed 48-bit MAC like aa:bb:cc:dd:ee:ff.
 

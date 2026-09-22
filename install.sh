@@ -10,8 +10,10 @@
 #
 set -euo pipefail
 
-REPO_URL="${WIFI_AUDIT_REPO:-https://github.com/AliSalih-ops/providence-wifi-tool.git}"
-BRANCH="${WIFI_AUDIT_BRANCH:-main}"
+# Hardcoded (NOT read from the environment): an env var surviving the sudo
+# boundary must never be able to redirect what we clone and run as root.
+REPO_URL="https://github.com/AliSalih-ops/providence-wifi-tool.git"
+BRANCH="main"
 PREFIX="/opt/pr0v1dence"
 LAUNCHER="/usr/local/bin/pr0v1dence"
 DESKTOP="/usr/share/applications/pr0v1dence.desktop"
@@ -19,10 +21,12 @@ DESKTOP="/usr/share/applications/pr0v1dence.desktop"
 say() { printf '\033[1;36m[pr0v1dence]\033[0m %s\n' "$*"; }
 err() { printf '\033[1;31m[pr0v1dence]\033[0m %s\n' "$*" >&2; }
 
-# Re-run ourselves as root if needed (preserving env for the sudo prompt).
+# Re-run as root if needed. Plain sudo (NOT sudo -E): resetting the environment
+# drops PYTHONPATH / LD_PRELOAD / LD_LIBRARY_PATH etc. so a hostile env cannot
+# reach the root interpreter or the root tools it spawns.
 if [ "$(id -u)" -ne 0 ]; then
   say "Root is required to install packages; elevating with sudo..."
-  exec sudo -E bash "$0" "$@"
+  exec sudo bash "$0" "$@"
 fi
 
 if ! command -v apt-get >/dev/null 2>&1; then
@@ -55,7 +59,9 @@ DIR="$PREFIX"
 needs_root=1
 for a in "\$@"; do case "\$a" in --demo|--selftest|--version|-h|--help) needs_root=0 ;; esac; done
 if [ "\$needs_root" -eq 1 ] && [ "\$(id -u)" -ne 0 ]; then
-  exec sudo -E "\$0" "\$@"
+  # Plain sudo + only DISPLAY/XAUTHORITY forwarded (no -E): the GUI still opens
+  # on your X session, but PYTHONPATH/LD_* cannot ride into the root process.
+  exec sudo DISPLAY="\${DISPLAY:-}" XAUTHORITY="\${XAUTHORITY:-}" "\$0" "\$@"
 fi
 cd "\$DIR" || { echo "Install dir \$DIR is missing; re-run install.sh"; exit 1; }
 exec python3 -m providence "\$@"

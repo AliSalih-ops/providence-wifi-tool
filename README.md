@@ -77,7 +77,9 @@ Or install the `pr0v1dence` command into an isolated environment with pipx
 
 ```bash
 pipx install git+https://github.com/AliSalih-ops/providence-wifi-tool.git
-sudo -E env "PATH=$PATH" pr0v1dence
+# Run as root WITHOUT importing your whole env (no `sudo -E`): forward only the
+# X display so a hostile PYTHONPATH/LD_* can't reach the root interpreter.
+sudo DISPLAY="$DISPLAY" XAUTHORITY="$XAUTHORITY" "$(command -v pr0v1dence)"
 ```
 
 </details>
@@ -89,6 +91,7 @@ pr0v1dence          # if installed via install.sh / pipx
 ./run.sh            # from a clone — launches the GUI (re-execs with sudo, radio work needs root)
 ./run.sh --demo     # simulated data, no radio, no root — preview the UI anywhere
 ./run.sh --selftest # offline logic tests, then exit
+./run.sh --stresstest # fuzz every hostile-input parser, then exit
 ```
 
 Or directly:
@@ -172,6 +175,25 @@ providence-wifi-tool/
     gui.py            the Tkinter application
     selftest.py       the tests
 ```
+
+## Security model
+
+This tool runs as **root** and parses data from **hostile access points**, so it
+is written to that threat model — see [ARCHITECTURE.md](ARCHITECTURE.md) for the
+full design. In short: launchers elevate with plain `sudo` (never `sudo -E`) and
+forward only `DISPLAY`/`XAUTHORITY`; the app scrubs `LD_*`/`PYTHONPATH` and pins
+`PATH`; every tool call is an argv list (no shell) with validated BSSIDs/MACs;
+captures default to a root-owned dir and refuse symlinked output paths; all
+hostile-input parsing is byte/row/entry bounded (beacon-flood safe) and strips
+control chars; PMKID capture is BSSID-scoped or refuses; and the app makes no
+network connections. It is validated by `--selftest` (unit) and `--stresstest`
+(adversarial fuzz of every parser). Two adversarial audit passes were run and
+their confirmed findings fixed.
+
+> **Packaging note:** the PolyForm-Strict license is intentionally source-
+> available and **not** DFSG-free, so this can't ship in Debian *main*; distribute
+> the `.deb` from this repo's releases (or a private/`non-free` repo), which is
+> exactly how it's set up.
 
 ## Notes / limitations
 

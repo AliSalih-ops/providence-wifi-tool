@@ -13,6 +13,7 @@ import tempfile
 from .capture import (
     CaptureSession,
     CaptureTarget,
+    PmkidSession,
     _scan_handshake_text,
     _scope_22000_file,
     capture_argv,
@@ -285,6 +286,39 @@ def run() -> int:
     c.eq("cap_file picks newest by mtime", os.path.basename(cs.cap_file()), os.path.basename(newer))
     import shutil as _sh
     _sh.rmtree(tmp, ignore_errors=True)
+
+    print("== security hardening ==")
+    # hcxdumptool 6.3 RF-scopes via --bpf (not the removed filterlist flags)
+    hv63b = hcxdumptool_argv("wlan0mon", "/tmp/x.pcapng", "6", "/tmp/f", (6, 3), "/tmp/t.bpf")
+    c.ok("6.3 uses --bpf when scoped",
+         any(a.startswith("--bpf=") for a in hv63b) and not any("filterlist" in a for a in hv63b))
+    c.ok("6.2 keeps filterlist not bpf",
+         any("filterlist_ap" in a for a in hcxdumptool_argv("w", "o", "6", "/f", (6, 2))))
+    # handshake detection anchored to the BSSID column, not attacker ESSID text
+    forged = "   1  DE:AD:BE:EF:00:11  AA:BB:CC:11:22:33 (1 handshake)   WPA (1 handshake)\n"
+    c.ok("forged ESSID cannot spoof handshake", not _scan_handshake_text(forged, "AA:BB:CC:11:22:33"))
+    legit = "   1  AA:BB:CC:11:22:33  MyNet   WPA (1 handshake)\n"
+    c.ok("real target row still detected", _scan_handshake_text(legit, "AA:BB:CC:11:22:33"))
+    # ESSID control chars (ANSI/CSI/DEL/C1) stripped from parsed output
+    ctl = SAMPLE_CSV.replace("ACME-Corp", "AC\x1b[31m\x7f\x9bME")
+    aps_ctl, _ = parse_csv(ctl)
+    ess = aps_ctl[0].essid
+    c.ok("ANSI/DEL/C1 stripped from ESSID",
+         "\x1b" not in ess and "\x7f" not in ess and "\x9b" not in ess)
+    # beacon-flood row cap
+    from .scan import MAX_ROWS
+    hdr = SAMPLE_CSV.split("\n\n")[0] + "\n\n"
+    flood = hdr + "".join(f"AA:BB:CC:{i//256:02x}:{i%256:02x}:01, t, t, 6, 195, WPA2, CCMP, PSK, "
+                          f"-40, 1, 0, 0.0.0.0, 3, N, \n" for i in range(MAX_ROWS + 500))
+    fa, _ = parse_csv(flood)
+    c.ok("parse_csv caps rows under flood", len(fa) <= MAX_ROWS)
+
+    print("== architecture: Session contract ==")
+    from .session import Session
+    c.ok("CaptureSession conforms to Session", issubclass(CaptureSession, Session))
+    c.ok("PmkidSession conforms to Session", issubclass(PmkidSession, Session))
+    c.ok("DemoCaptureSession conforms to Session", issubclass(DemoCaptureSession, Session))
+    c.ok("DemoPmkidSession conforms to Session", issubclass(DemoPmkidSession, Session))
 
     print("== demo interfaces & flow ==")
     di = demo_interfaces()

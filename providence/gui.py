@@ -28,7 +28,6 @@ from .capture import (
     CaptureSession, CaptureTarget, PmkidSession, injection_test, is_valid_channel,
     pmkid_detection_available,
 )
-from .util import reown
 from .iface import (
     Interface, current_mac, disable_monitor, enable_monitor, list_interfaces, set_mac,
 )
@@ -56,6 +55,8 @@ AUTOVERIFY_MS = 5000      # how often a running capture/PMKID is auto-checked
 CAPTURE_TICK_MS = 1000    # elapsed-timer / liveness tick cadence
 PUMP_MS = 100             # UI queue drain cadence
 LOG_MAX_LINES = 2000      # trim the activity log beyond this to bound memory
+MAX_APS = 300             # cap networks shown (beacon-flood safety)
+MAX_QUEUED_LOGS = 20000   # drop log lines past this so a flood can't grow memory
 
 
 class App:
@@ -73,7 +74,13 @@ class App:
         self.armed = False                 # authorization accepted
         self.scope = ""                    # what the user said they're authorized to test
         # Captures persist here (not /tmp) so they're easy to find afterwards.
-        self.out_dir = os.path.join(os.path.expanduser("~"), "pr0v1dence-captures")
+        # As root, default to a root-owned location (/root) rather than trusting
+        # $HOME, whose parent may be writable by an unprivileged user and abusable
+        # for a symlink attack; off-root (demo/dev) use the real home.
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            self.out_dir = "/root/pr0v1dence-captures"
+        else:
+            self.out_dir = os.path.join(os.path.expanduser("~"), "pr0v1dence-captures")
 
         self._log_q: "queue.Queue[str]" = queue.Queue()
         self._ui_q: "queue.Queue[Callable]" = queue.Queue()
@@ -370,22 +377,36 @@ class App:
 
     # ----------------------------------------------------------- log / pump
     def log(self, msg: str) -> None:
-        """Thread-safe: queue a line to be shown on the main thread."""
-        self._log_q.put(str(msg))
+        """Thread-safe: queue a line to be shown on the main thread. Drops lines
+        past MAX_QUEUED_LOGS so a stalled pump can't grow memory without bound."""
+        if self._log_q.qsize() < MAX_QUEUED_LOGS:
+            self._log_q.put(str(msg))
 
     def _disk_log(self, line: str) -> None:
-        """Append one log line to an on-disk audit trail (best-effort)."""
+        """Append one log line to an on-disk audit trail (best-effort, symlink-safe,
+        size-bounded). Scope is captured by the 'Authorization confirmed' line."""
+        if self.demo or not self.out_dir:
+            return
         try:
-            if self._log_fh is None and self.out_dir and not self.demo:
-                os.makedirs(self.out_dir, exist_ok=True)
-                self._log_fh = open(os.path.join(self.out_dir, "pr0v1dence.log"), "a", encoding="utf-8")
-                reown(self.out_dir)
-                # Scope is written by the "Authorization confirmed. Scope: …" log
-                # line, so the banner stays scope-free (it may open pre-auth).
+            if self._log_fh is None:
+                if os.path.islink(self.out_dir):
+                    return
+                os.makedirs(self.out_dir, mode=0o700, exist_ok=True)
+                path = os.path.join(self.out_dir, "pr0v1dence.log")
+                # Rotate once past ~5 MB so the log can't grow without bound.
+                try:
+                    if os.path.exists(path) and os.path.getsize(path) > 5_000_000:
+                        os.replace(path, path + ".1")
+                except OSError:
+                    pass
+                if os.name == "posix":
+                    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
+                    self._log_fh = os.fdopen(fd, "a", encoding="utf-8")
+                else:
+                    self._log_fh = open(path, "a", encoding="utf-8")
                 self._log_fh.write("\n===== session start =====\n")
-            if self._log_fh:
-                self._log_fh.write(line.rstrip() + "\n")
-                self._log_fh.flush()
+            self._log_fh.write(line.rstrip() + "\n")
+            self._log_fh.flush()
         except OSError:
             self._log_fh = None
 
@@ -595,6 +616,13 @@ class App:
         if d:
             self.out_dir = d
             self.outdir_lbl.configure(text=d)
+            # Reopen the audit log in the new folder on the next line.
+            if self._log_fh:
+                try:
+                    self._log_fh.close()
+                except OSError:
+                    pass
+                self._log_fh = None
             self.log(f"Captures will be saved to {d}")
 
     def on_open_folder(self) -> None:
@@ -640,16 +668,25 @@ class App:
 
     # ------------------------------------------------------- out dir / bands
     def _ensure_out_dir(self) -> bool:
+        d = self.out_dir
         try:
-            os.makedirs(self.out_dir, exist_ok=True)
-            try:
-                os.chmod(self.out_dir, 0o700)
-            except OSError:
-                pass
-            reown(self.out_dir)
+            # Refuse a symlinked output folder: as root, chmod/open through a
+            # symlink would let an unprivileged user redirect writes (CWE-59).
+            if os.path.islink(d):
+                messagebox.showerror("Folder", "Refusing: the output folder is a symlink.")
+                return False
+            os.makedirs(d, mode=0o700, exist_ok=True)
+            if os.name == "posix":
+                # Tighten perms via an O_NOFOLLOW directory handle so a swapped-in
+                # symlink can't be chmod'd through as root.
+                fd = os.open(d, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                try:
+                    os.fchmod(fd, 0o700)
+                finally:
+                    os.close(fd)
             return True
         except OSError as e:
-            messagebox.showerror("Folder", f"Can't create output folder:\n{e}")
+            messagebox.showerror("Folder", f"Can't use output folder:\n{e}")
             return False
 
     def _update_band_choices(self) -> None:
@@ -764,7 +801,9 @@ class App:
                 self.log("airodump said:\n" + tail)
             return
         aps, stations = self.scan.latest()
-        self.aps = sorted(aps, key=lambda a: _pwr_key(a.power), reverse=True)
+        # Keep only the strongest MAX_APS so a flood of forged BSSIDs can't
+        # grow self.aps / the Treeview without bound.
+        self.aps = sorted(aps, key=lambda a: _pwr_key(a.power), reverse=True)[:MAX_APS]
         self.stations = stations
         self._refresh_ap_tree()
         self._refresh_client_tree()   # keep client list + target label fresh
@@ -888,6 +927,8 @@ class App:
             self.capture.stop()
             self.log("Capture stopped.")
         self._cap_start = None
+        self._cap_gen += 1          # discard any in-flight verify from this session
+        self._verify_busy = False
         self.cap_status.configure(text="")
         self._refresh_action_states()
 
@@ -1039,6 +1080,8 @@ class App:
             self.pmkid.stop()
             self.log("PMKID capture stopped.")
         self._pmkid_start = None
+        self._pmkid_gen += 1
+        self._pmkid_busy = False
         self.pmkid_status.configure(text="")
         self._refresh_action_states()
 
@@ -1193,6 +1236,12 @@ class App:
             self.pmkid = None
         self._cap_start = None
         self._pmkid_start = None
+        # Invalidate any in-flight verify/PMKID worker so a late result can't
+        # touch the next session, and clear the busy guards.
+        self._cap_gen += 1
+        self._pmkid_gen += 1
+        self._verify_busy = False
+        self._pmkid_busy = False
         # Reset the indicators + statuses so nothing stale (a stuck "CAPTURED"
         # light, an enabled Export) survives Restore networking.
         self._hs_ok = False

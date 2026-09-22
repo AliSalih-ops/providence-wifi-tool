@@ -38,7 +38,8 @@ Version: $VERSION
 Section: net
 Priority: optional
 Architecture: $ARCH
-Depends: python3, python3-tk, iw, iproute2, aircrack-ng, hcxtools, hcxdumptool, macchanger
+Depends: python3, python3-tk, iw, iproute2, aircrack-ng, sudo
+Recommends: hcxtools, hcxdumptool, macchanger, tcpdump, xdg-utils, desktop-file-utils
 Maintainer: Ali Salih <ali.s.mirkhan@gmail.com>
 Description: pr0v1dence WiFi Tool - authorized WPA/WPA2 handshake & PMKID capture GUI
  A single graphical front-end over the aircrack-ng suite that walks the whole
@@ -53,9 +54,13 @@ cat > "$ROOT/usr/bin/pr0v1dence" <<'EOF'
 needs_root=1
 for a in "$@"; do case "$a" in --demo|--selftest|--version|-h|--help) needs_root=0 ;; esac; done
 if [ "$needs_root" -eq 1 ] && [ "$(id -u)" -ne 0 ]; then
-  exec sudo -E "$0" "$@"
+  # No -E: forward only DISPLAY/XAUTHORITY so a hostile PYTHONPATH/LD_* cannot
+  # reach the root interpreter or the root tools it spawns.
+  exec sudo DISPLAY="${DISPLAY:-}" XAUTHORITY="${XAUTHORITY:-}" "$0" "$@"
 fi
-export PYTHONPATH="/usr/lib/pr0v1dence${PYTHONPATH:+:$PYTHONPATH}"
+# Set PYTHONPATH only AFTER we are root, to our fixed system path (never an
+# inherited value), so `python3 -m providence` resolves to the installed code.
+export PYTHONPATH="/usr/lib/pr0v1dence"
 exec python3 -m providence "$@"
 EOF
 chmod 0755 "$ROOT/usr/bin/pr0v1dence"

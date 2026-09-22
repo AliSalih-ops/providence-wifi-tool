@@ -27,7 +27,9 @@ fi
 
 if [[ "$needs_root" -eq 1 && "${EUID:-$(id -u)}" -ne 0 ]]; then
   echo "Radio actions need root; re-launching with sudo..."
-  exec sudo -E python3 -m providence "$@"
+  # No -E: forward only DISPLAY/XAUTHORITY so a hostile PYTHONPATH/LD_* can't
+  # ride into the root interpreter and its root child tools.
+  exec sudo DISPLAY="${DISPLAY:-}" XAUTHORITY="${XAUTHORITY:-}" python3 -m providence "$@"
 fi
 
 exec python3 -m providence "$@"

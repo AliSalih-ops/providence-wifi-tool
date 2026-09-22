@@ -195,16 +195,19 @@ def _scan_handshake_text(text: str, bssid: str = "") -> bool:
     when a target BSSID is given the marker must be on that BSSID's row, so a
     handshake for a different network in the same .cap isn't a false positive.
     """
+    target = bssid.lower()
     for line in text.splitlines():
         low = line.lower()
-        if "handshake" in low and "(0 handshake" not in low and "no valid" not in low:
-            if not bssid or bssid.lower() in low:
-                return True
-    # Only when no specific target was named do we accept a marker that appears
-    # without a BSSID on its line; a targeted check must match the target's row
-    # so a handshake for some *other* network in the same .cap isn't a false hit.
-    if not bssid:
-        return bool(re.search(r"\(\s*[1-9]\d*\s*handshake", text, re.I))
+        if "handshake" not in low or "(0 handshake" in low or "no valid" in low:
+            continue
+        if not target:
+            return True
+        # Anchor the match to the real BSSID *column* (token 2 of an aircrack row:
+        # "<idx> <BSSID> <ESSID...> <enc> (N handshake)"), so a hostile ESSID that
+        # merely CONTAINS the target's BSSID text can't forge a positive.
+        toks = line.split()
+        if len(toks) >= 2 and is_mac(toks[1]) and toks[1].lower() == target:
+            return True
     return False
 
 
@@ -308,7 +311,8 @@ def pmkid_detection_available() -> bool:
 
 
 def hcxdumptool_argv(iface: str, out_pcapng: str, channel: Optional[str] = None,
-                     filter_file: Optional[str] = None, version: Optional[tuple] = None) -> list:
+                     filter_file: Optional[str] = None, version: Optional[tuple] = None,
+                     bpf_file: Optional[str] = None) -> list:
     """Build an hcxdumptool command for clientless (PMKID) capture.
 
     `--filterlist_ap`/`--filtermode` (target whitelist) exist ONLY on the
@@ -321,8 +325,14 @@ def hcxdumptool_argv(iface: str, out_pcapng: str, channel: Optional[str] = None,
     argv = ["hcxdumptool", "-i", iface, "-w", out_pcapng]
     if channel:
         argv += ["-c", str(channel)]
-    if filter_file and version is not None and version < (6, 3):
-        argv += ["--filterlist_ap=" + filter_file, "--filtermode=2"]
+    if version is not None and version < (6, 3):
+        # 6.0-6.2: AP whitelist keeps the active attack on the target only.
+        if filter_file:
+            argv += ["--filterlist_ap=" + filter_file, "--filtermode=2"]
+    else:
+        # 6.3+ removed those flags; RF-scope with a compiled BPF instead.
+        if bpf_file:
+            argv += ["--bpf=" + bpf_file]
     return argv
 
 
@@ -391,20 +401,50 @@ class PmkidSession:
             if self.log:
                 self.log(f"Could not write PMKID target filter: {e}")
             return
-        self._logpath = self.pcapng + ".log"
-        self._logfh = open(self._logpath, "w")
         chan = self.target.channel if is_valid_channel(self.target.channel) else None
         ver = hcxdumptool_version(log=self.log)
-        self._proc = spawn(hcxdumptool_argv(self.mon_iface, self.pcapng, chan, self._filter_file, ver),
+        bpf_file = None
+        if ver is None or ver >= (6, 3):
+            # 6.3+ removed the AP whitelist. RF-scope via a compiled BPF, or REFUSE:
+            # never run an unscoped active PMKID attack across the whole channel
+            # (that would probe APs outside the authorized target).
+            bpf_file = self._build_bpf()
+            if not bpf_file:
+                if self.log:
+                    self.log("Refusing PMKID: hcxdumptool 6.3+ can't be RF-scoped to the target "
+                             "without a BPF filter (needs tcpdump). Install tcpdump, or use the "
+                             "handshake path (which is BSSID-scoped by airodump).")
+                return
+        self._logpath = self.pcapng + ".log"
+        self._logfh = open(self._logpath, "w")
+        self._proc = spawn(hcxdumptool_argv(self.mon_iface, self.pcapng, chan, self._filter_file, ver, bpf_file),
                            log=self.log, out=self._logfh)
         if self.log:
             vtxt = f"{ver[0]}.{ver[1]}" if ver else "unknown"
-            self.log(f"PMKID capture on {self.mon_iface} (hcxdumptool {vtxt}) targeting "
+            scope = "BPF-scoped" if bpf_file else "AP-whitelist scoped"
+            self.log(f"PMKID capture on {self.mon_iface} (hcxdumptool {vtxt}, {scope}) targeting "
                      f"{self.target.bssid} -> {os.path.basename(self.pcapng)}")
-            if ver is None or ver >= (6, 3):
-                self.log("  note: 6.3+ dropped RF BSSID-filtering; capture is scoped by "
-                         "detection + export to the target, and if it errors on the interface, "
-                         "hand hcxdumptool the base (managed) interface instead of the monitor VIF.")
+
+    def _build_bpf(self) -> Optional[str]:
+        """Compile a Berkeley Packet Filter restricting capture to the target
+        BSSID (for hcxdumptool 6.3+ which dropped --filterlist_ap). Returns the
+        BPF file path, or None if tcpdump is unavailable / compilation failed."""
+        if which("tcpdump") is None:
+            return None
+        b = self.target.bssid
+        if not is_mac(b):
+            return None
+        expr = f"wlan addr1 {b} or wlan addr2 {b} or wlan addr3 {b}"
+        res = run(["tcpdump", "-y", "IEEE802_11_RADIO", "-ddd", expr], timeout=15, log=self.log)
+        if not res.ok or not res.out.strip():
+            return None
+        bpf = self.pcapng + ".bpf"
+        try:
+            with open(bpf, "w") as f:
+                f.write(res.out)
+        except OSError:
+            return None
+        return bpf
 
     def running(self) -> bool:
         return self._proc is not None and self._proc.poll() is None

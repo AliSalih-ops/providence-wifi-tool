@@ -18,6 +18,11 @@ from typing import Dict, List, Optional, Tuple
 
 from .util import LogFn, is_mac, spawn, terminate
 
+# Bounds so a beacon/probe flood (thousands of forged BSSIDs) can't make the
+# root process read/parse/allocate without limit.
+MAX_CSV_BYTES = 4_000_000   # cap how much of the (cumulative) CSV we read
+MAX_ROWS = 5000             # cap APs/stations parsed per poll
+
 
 @dataclass
 class AccessPoint:
@@ -120,6 +125,8 @@ def parse_csv(text: str) -> Tuple[List[AccessPoint], List[Station]]:
     st_lines = lines[station_hdr + 1 :] if station_hdr is not None else []
 
     for line in ap_lines:
+        if len(aps) >= MAX_ROWS:
+            break
         s = line.strip()
         if not s or s.startswith("BSSID"):
             continue
@@ -132,7 +139,10 @@ def parse_csv(text: str) -> Tuple[List[AccessPoint], List[Station]]:
         # ESSID may itself contain commas; everything from field 13 up to the
         # final "Key" field is the ESSID. Strip control chars for safe display.
         essid = ",".join(parts[13:-1]).strip() if len(parts) > 14 else parts[13]
-        essid = "".join(ch for ch in essid if ch >= " " or ch == "\t")
+        # Keep printable ASCII, tab, and >=U+00A0 (real UTF-8 SSIDs); strip C0
+        # (ANSI/CSI escapes), DEL, and C1 so nothing can inject terminal escapes
+        # into the on-disk audit log when it is later cat'd.
+        essid = "".join(ch for ch in essid if (" " <= ch <= "~") or ch == "\t" or ch >= "\xa0")
         aps.append(
             AccessPoint(
                 bssid=parts[0],
@@ -148,6 +158,8 @@ def parse_csv(text: str) -> Tuple[List[AccessPoint], List[Station]]:
 
     ap_by_bssid: Dict[str, AccessPoint] = {a.bssid: a for a in aps}
     for line in st_lines:
+        if len(stations) >= MAX_ROWS:
+            break
         s = line.strip()
         if not s or s.startswith("Station MAC"):
             continue
@@ -222,7 +234,7 @@ class ScanSession:
         newest = max(files, key=lambda p: os.path.getmtime(p))
         try:
             with open(newest, "r", errors="replace") as f:
-                text = f.read()
+                text = f.read(MAX_CSV_BYTES)   # bounded read (beacon-flood safety)
         except OSError:
             return [], []
         return parse_csv(text)
