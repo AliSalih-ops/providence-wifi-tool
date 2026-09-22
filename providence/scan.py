@@ -242,6 +242,32 @@ class ScanSession:
             return [], []
         return parse_csv(text)
 
+    def diagnostic(self) -> str:
+        """Describe the CSV state so a '0 networks' can be diagnosed from the log:
+        does the file exist, how big is it, what do its first AP lines look like,
+        and how many rows parse."""
+        if not self._prefix:
+            return "no scan prefix"
+        files = glob.glob(self._prefix + "-*.csv")
+        if not files:
+            return f"no CSV yet at {self._prefix}-*.csv (airodump not writing?)"
+        newest = max(files, key=lambda p: os.path.getmtime(p))
+        try:
+            with open(newest, "r", errors="replace") as f:
+                text = f.read(MAX_CSV_BYTES)
+        except OSError as e:
+            return f"cannot read {newest}: {e}"
+        aps, sta = parse_csv(text)
+        # First non-empty, non-header data line, for format inspection.
+        sample = ""
+        for ln in text.replace("\r\n", "\n").split("\n"):
+            s = ln.strip()
+            if s and not s.startswith("BSSID") and not s.startswith("Station MAC"):
+                sample = s[:160]
+                break
+        return (f"csv={os.path.basename(newest)} bytes={len(text)} parsed_aps={len(aps)} "
+                f"parsed_sta={len(sta)} first_data_line={sample!r}")
+
     def log_tail(self, n: int = 8) -> str:
         """Last few lines airodump wrote - used to explain an unexpected exit."""
         if not self._logpath or not os.path.exists(self._logpath):

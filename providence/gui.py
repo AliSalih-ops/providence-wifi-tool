@@ -95,6 +95,7 @@ class App:
         self._pmkid_gen = 0
         self._timers: dict = {}            # named after() ids, so we never double-schedule
         self._log_fh = None                # on-disk activity log (opened lazily)
+        self._scan_empty_polls = 0         # for the 0-networks self-diagnostic
 
         self._build_style()
         self._build_widgets()
@@ -786,6 +787,7 @@ class App:
             messagebox.showerror("Scan", "airodump-ng failed to start. Is aircrack-ng installed and "
                                         "are you running as root?")
             return
+        self._scan_empty_polls = 0
         self.btn_scan.configure(text="Stop scan")
         self.scan_status.configure(text=f"scanning {self.band_var.get()}...", foreground=C["warn"])
         self._schedule("scan", SCAN_POLL_MS, self._poll_scan)
@@ -818,6 +820,14 @@ class App:
         self.stations = stations
         self._refresh_ap_tree()
         self._refresh_client_tree()   # keep client list + target label fresh
+        # Self-diagnose a persistent 0-networks: after a few empty polls, report
+        # the CSV state (exists? size? does it parse?) into the activity log.
+        if not self.aps:
+            self._scan_empty_polls += 1
+            if self._scan_empty_polls == 4:
+                self.log("Still 0 networks after 8s — CSV check: " + self.scan.diagnostic())
+        else:
+            self._scan_empty_polls = 0
         self.scan_status.configure(text=f"scanning {self.band_var.get()} - {len(self.aps)} networks",
                                    foreground=C["warn"])
         self._schedule("scan", SCAN_POLL_MS, self._poll_scan)
