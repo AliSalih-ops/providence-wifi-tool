@@ -184,11 +184,12 @@ def enable_monitor(iface: Interface, kill_networkmanager: bool = False,
         run(["airmon-ng", "check", "kill"], log=log)
     else:
         # Surgical: release ONLY this interface from NetworkManager (a wired
-        # uplink stays up), and stop wpa_supplicant — which fights monitor mode
-        # by rescanning / re-tuning / re-managing the card. wpa_supplicant is
-        # WiFi-only, so an Ethernet connection is unaffected.
+        # uplink stays up), and MASK wpa_supplicant so NM/systemd can't respawn
+        # it — a plain stop is useless because it comes right back and re-tunes
+        # the card, breaking monitor capture. wpa_supplicant is WiFi-only, so an
+        # Ethernet connection is unaffected. disable_monitor unmasks it again.
         run(["nmcli", "device", "set", iface.name, "managed", "no"], log=log)
-        run(["systemctl", "stop", "wpa_supplicant"], log=log)
+        run(["systemctl", "mask", "--now", "wpa_supplicant"], log=log)
         run(["pkill", "-x", "wpa_supplicant"], log=log)
 
     run(["airmon-ng", "start", iface.name], timeout=30, log=log)
@@ -235,8 +236,9 @@ def disable_monitor(mon_iface: str, restore_services: bool = True, log: Optional
         return
     if which("nmcli"):
         base = mon_iface[:-3] if mon_iface.endswith("mon") else mon_iface
-        # Bring wpa_supplicant back so normal WiFi works again, then re-hand the
-        # interface to NetworkManager (we never touched NM, so no eth0 bounce).
+        # Unmask + start wpa_supplicant so normal WiFi works again, then re-hand
+        # the interface to NetworkManager (we never touched NM, so no eth0 bounce).
+        run(["systemctl", "unmask", "wpa_supplicant"], log=log)
         run(["systemctl", "start", "wpa_supplicant"], log=log)
         run(["nmcli", "device", "set", base, "managed", "yes"], log=log)
         if base != mon_iface:
