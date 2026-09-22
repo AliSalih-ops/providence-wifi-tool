@@ -1,0 +1,7 @@
+# Force LF on checkout everywhere so shell scripts run on Linux even when the
+# repo is edited or cloned from Windows.
+* text=auto eol=lf
+*.sh text eol=lf
+*.py text eol=lf
+*.desktop text eol=lf
+*.md text eol=lf

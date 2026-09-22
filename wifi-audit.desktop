@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=WiFi Audit GUI
+GenericName=WPA handshake & PMKID capture
+Comment=Authorized WPA/WPA2 handshake and PMKID capture (aircrack-ng front-end)
+Exec=wifi-audit
+Icon=network-wireless
+Terminal=true
+Categories=Network;Security;System;
+Keywords=wifi;wpa;wpa2;handshake;pmkid;pentest;aircrack;kali;

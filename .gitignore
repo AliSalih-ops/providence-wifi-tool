@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# Captures / tool output (never commit captured traffic)
+*.cap
+*.pcap
+*.pcapng
+*.22000
+*.hccapx
+wifi-audit-captures/
+
+# OS cruft
+.DS_Store
+._*
+Thumbs.db
