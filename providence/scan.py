@@ -224,7 +224,7 @@ class ScanSession:
         self._logpath = os.path.join(self._tmpdir, "airodump.log")
         self._logfh = open(self._logpath, "w")
         self._proc = spawn(scan_argv(self.mon_iface, self._prefix, self.band),
-                           log=self.log, out=self._logfh)
+                           log=self.log, out=self._logfh, tty=True)
 
     def latest(self) -> Tuple[List[AccessPoint], List[Station]]:
         """Read and parse the most recent CSV airodump has written so far."""

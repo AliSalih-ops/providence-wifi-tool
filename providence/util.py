@@ -11,6 +11,7 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Sequence
@@ -92,23 +93,73 @@ def run(
     return res
 
 
+def _drain_pty(master_fd: int, out_fh) -> None:
+    """Read (and optionally log) a pty master in a daemon thread so the child's
+    terminal buffer never fills and blocks it."""
+    def run():
+        try:
+            while True:
+                data = os.read(master_fd, 4096)
+                if not data:
+                    break
+                if out_fh is not None:
+                    try:
+                        out_fh.write(data.decode("utf-8", "replace"))
+                        out_fh.flush()
+                    except (OSError, ValueError):
+                        pass
+        except OSError:
+            pass
+    threading.Thread(target=run, daemon=True).start()
+
+
+def _spawn_pty(argv, out) -> Optional[subprocess.Popen]:
+    """Run argv attached to a pseudo-terminal. airodump-ng (and other curses
+    tools) only run their capture loop when stdout is a TTY — piped to a file or
+    /dev/null they write just the CSV header and capture NOTHING. The pty makes
+    the child see a terminal; we drain the master into `out`. Returns None to let
+    the caller fall back to a plain pipe (e.g. no openpty / not found)."""
+    master = slave = None
+    try:
+        master, slave = os.openpty()
+        proc = subprocess.Popen(argv, stdin=slave, stdout=slave, stderr=slave)
+    except (OSError, ValueError):
+        for fd in (master, slave):
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+        return None
+    os.close(slave)
+    _drain_pty(master, out)
+    proc._pty_master = master   # closed by terminate()
+    return proc
+
+
 def spawn(
     argv: Sequence[str],
     log: Optional[LogFn] = None,
     out=None,
+    tty: bool = False,
 ) -> Optional[subprocess.Popen]:
     """Start a long-running command in the background and return the Popen.
 
-    Used for airodump-ng (scan/capture) which runs until we stop it. Its output
-    is NOT piped back to us: airodump is long-running and chatty, so an undrained
-    PIPE fills its ~64 KB buffer and blocks the process (freezing the capture).
-    Instead we send output to a caller-provided file handle (so a failed launch
-    can be diagnosed), or to /dev/null. Parsing is done off the CSV files
-    airodump writes, never this stream.
+    Used for airodump-ng / hcxdumptool (scan/capture) which run until stopped.
+    With tty=True the child is attached to a pseudo-terminal (REQUIRED for
+    airodump-ng to actually capture); otherwise output goes to a caller file
+    handle (for diagnostics) or /dev/null. Never an undrained PIPE — airodump is
+    chatty and a full pipe buffer would freeze it. Parsing is done off the CSV
+    files, never this stream.
     """
     argv = [str(a) for a in argv]
     if log:
         log("$ " + " ".join(argv) + "  &")
+    if tty and hasattr(os, "openpty"):
+        proc = _spawn_pty(argv, out)
+        if proc is not None:
+            return proc
+        # pty setup failed — fall through to a plain pipe
     try:
         return subprocess.Popen(
             argv,
@@ -123,19 +174,28 @@ def spawn(
 
 
 def terminate(proc: Optional[subprocess.Popen], log: Optional[LogFn] = None) -> None:
-    """Politely stop a background process, then kill it if it refuses to die."""
-    if proc is None or proc.poll() is not None:
+    """Politely stop a background process, then kill it if it refuses to die.
+    Also closes any pty master, which ends its drain thread."""
+    if proc is None:
         return
     try:
-        proc.terminate()
-        try:
-            proc.wait(timeout=3)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=3)
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=3)
     except Exception as e:  # pragma: no cover - defensive
         if log:
             log(f"  (failed to stop pid {proc.pid}: {e})")
+    master = getattr(proc, "_pty_master", None)
+    if master is not None:
+        try:
+            os.close(master)
+        except OSError:
+            pass
+        proc._pty_master = None
 
 
 _MAC_RE = re.compile(r"^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$")

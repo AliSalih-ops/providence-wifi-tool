@@ -116,7 +116,7 @@ class CaptureSession:
         self._logfh = open(self._logpath, "w")
         self._proc = spawn(
             capture_argv(self.mon_iface, self.target.bssid, self.target.channel, self.prefix),
-            log=self.log, out=self._logfh,
+            log=self.log, out=self._logfh, tty=True,
         )
         if self.log:
             self.log(f"Capturing {self.target.essid or self.target.bssid} on channel {self.target.channel}")
@@ -418,7 +418,7 @@ class PmkidSession:
         self._logpath = self.pcapng + ".log"
         self._logfh = open(self._logpath, "w")
         self._proc = spawn(hcxdumptool_argv(self.mon_iface, self.pcapng, chan, self._filter_file, ver, bpf_file),
-                           log=self.log, out=self._logfh)
+                           log=self.log, out=self._logfh, tty=True)
         if self.log:
             vtxt = f"{ver[0]}.{ver[1]}" if ver else "unknown"
             scope = "BPF-scoped" if bpf_file else "AP-whitelist scoped"
