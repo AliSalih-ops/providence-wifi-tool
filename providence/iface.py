@@ -12,7 +12,7 @@ import re
 from dataclasses import dataclass
 from typing import List, Optional
 
-from .util import CmdResult, run, LogFn
+from .util import CmdResult, run, which, LogFn
 
 
 @dataclass
@@ -155,23 +155,43 @@ def _monitor_iface_now(prefer_phy: str = "") -> Optional[str]:
     return None
 
 
-def enable_monitor(iface: Interface, kill_interferers: bool = True, log: Optional[LogFn] = None) -> Optional[str]:
+# In-kernel Realtek USB drivers whose monitor mode is unreliable for the popular
+# 8188-class adapters — capture often shows 0 networks. The out-of-tree
+# realtek-rtl8188eus-dkms (module 8188eu(s)) is the fix.
+_WEAK_MONITOR_DRIVERS = {"rtl8xxxu", "r8188eu"}
+
+
+def _warn_weak_driver(driver: str, log: LogFn) -> None:
+    if driver in _WEAK_MONITOR_DRIVERS:
+        log(f"  note: the in-kernel '{driver}' driver has weak monitor support on this chip; "
+            "if scans show 0 networks, install realtek-rtl8188eus-dkms and blacklist "
+            f"'{driver}', then replug the adapter.")
+
+
+def enable_monitor(iface: Interface, kill_networkmanager: bool = False,
+                   log: Optional[LogFn] = None) -> Optional[str]:
     """Put `iface` into monitor mode. Returns the monitor interface name.
 
-    Primary path uses airmon-ng (which also renames to e.g. wlan0mon and can kill
-    NetworkManager/wpa_supplicant that otherwise fight monitor mode). If airmon-ng
-    doesn't yield a monitor interface, fall back to the manual iw/ip method.
+    By DEFAULT this is surgical: it releases only THIS interface from
+    NetworkManager (`nmcli device set <iface> managed no`) so your other links —
+    e.g. a wired uplink or a second adapter — keep their connectivity. Only when
+    `kill_networkmanager=True` (or nmcli is unavailable) does it fall back to the
+    blunt `airmon-ng check kill`, which stops NetworkManager/wpa_supplicant
+    globally and drops every connection.
     """
-    if kill_interferers:
-        # Stops NetworkManager & wpa_supplicant so they don't yank the card back
-        # to managed mode mid-capture. `airmon-ng stop` / restoring services undoes it.
+    if kill_networkmanager or which("nmcli") is None:
+        # Blunt fallback: stops NetworkManager & wpa_supplicant globally.
         run(["airmon-ng", "check", "kill"], log=log)
+    else:
+        # Free ONLY this interface; leave every other connection alone.
+        run(["nmcli", "device", "set", iface.name, "managed", "no"], log=log)
 
     run(["airmon-ng", "start", iface.name], timeout=30, log=log)
     mon = _monitor_iface_now(prefer_phy=iface.phy)
     if mon:
         if log:
             log(f"Monitor mode enabled: {mon}")
+            _warn_weak_driver(iface.driver, log)
         return mon
 
     # Fallback: manual switch on the original interface name.
@@ -189,18 +209,30 @@ def enable_monitor(iface: Interface, kill_interferers: bool = True, log: Optiona
 
 
 def disable_monitor(mon_iface: str, restore_services: bool = True, log: Optional[LogFn] = None) -> None:
-    """Take the card out of monitor mode and (optionally) bring networking back."""
+    """Take the card out of monitor mode and hand the interface back.
+
+    Mirror of enable_monitor: with nmcli we just re-manage this one interface
+    (the surgical path never touched anything else, so we must NOT restart
+    NetworkManager and bounce other links). Only without nmcli do we restart the
+    services that the blunt `airmon-ng check kill` fallback would have stopped.
+    """
     run(["airmon-ng", "stop", mon_iface], timeout=30, log=log)
-    if restore_services:
-        # `airmon-ng check kill` stops BOTH NetworkManager and wpa_supplicant,
-        # so bring both back. Best-effort across service managers / distros.
-        r = run(["systemctl", "restart", "NetworkManager"], log=log)
-        if not r.ok:
-            r2 = run(["service", "network-manager", "restart"], log=log)
-            if not r2.ok:
-                # Only when NetworkManager truly isn't here — restarting the
-                # supplicant on an NM stack would bounce the link NM just restored.
-                run(["systemctl", "restart", "wpa_supplicant"], log=log)
+    if not restore_services:
+        return
+    if which("nmcli"):
+        base = mon_iface[:-3] if mon_iface.endswith("mon") else mon_iface
+        run(["nmcli", "device", "set", base, "managed", "yes"], log=log)
+        if base != mon_iface:
+            run(["nmcli", "device", "set", mon_iface, "managed", "yes"], log=log)
+        if log:
+            log(f"Monitor mode disabled; {base} handed back to NetworkManager.")
+        return
+    # No nmcli: the blunt fallback stopped NM+wpa_supplicant globally, so restart.
+    r = run(["systemctl", "restart", "NetworkManager"], log=log)
+    if not r.ok:
+        r2 = run(["service", "network-manager", "restart"], log=log)
+        if not r2.ok:
+            run(["systemctl", "restart", "wpa_supplicant"], log=log)
     if log:
         log("Monitor mode disabled; networking restore attempted.")
 

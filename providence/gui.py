@@ -206,6 +206,12 @@ class App:
         self.btn_macrand.grid(row=1, column=2, padx=4, pady=2)
         self.btn_macrestore = ttk.Button(bar, text="Restore MAC", command=self.on_restore_mac)
         self.btn_macrestore.grid(row=1, column=3, padx=4)
+        # Off by default: monitor mode frees only the chosen adapter (nmcli), so a
+        # wired/other uplink keeps working. Tick this to fall back to the blunt
+        # `airmon-ng check kill` that stops NetworkManager for the whole machine.
+        self.kill_nm_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(bar, text="kill NetworkManager (drops ALL connections)",
+                        variable=self.kill_nm_var).grid(row=1, column=4, padx=8, sticky="w")
 
         self.status_lbl = ttk.Label(bar, text="", style="Muted.TLabel")
         self.status_lbl.grid(row=2, column=0, columnspan=5, padx=6, sticky="w")
@@ -549,7 +555,7 @@ class App:
         def work():
             if self.demo:
                 return iface.name + "mon"
-            return enable_monitor(iface, log=self.log)
+            return enable_monitor(iface, kill_networkmanager=self.kill_nm_var.get(), log=self.log)
 
         def done(mon):
             self.btn_mon.configure(state="normal")
