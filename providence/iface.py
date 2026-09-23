@@ -165,6 +165,24 @@ def restore_supplicant(log: Optional[LogFn] = None) -> None:
                 log(f"Could not remove leftover NM unmanage config: {e}")
         if which("nmcli"):
             run(["nmcli", "general", "reload"], log=None)
+    # Reset any interface a prior crash / force-quit / failed restore left in
+    # `type monitor` back to managed BEFORE the NM restart below, so NM adopts a
+    # usable card and the next Enable-monitor starts clean instead of erroring on
+    # an already-monitor interface. Mirrors the documented manual reset, which
+    # also begins with `airmon-ng stop`.
+    cleared = False
+    for i in _parse_iw_dev(_iw_dev()):
+        if i.mode == "monitor":
+            if which("airmon-ng"):
+                run(["airmon-ng", "stop", i.name], timeout=30, log=log)
+            leftover = _monitor_iface_now(prefer_phy=i.phy)
+            if leftover:  # airmon-ng absent or a wlan0mon survived — force it managed
+                run(["ip", "link", "set", leftover, "down"], log=log)
+                run(["iw", "dev", leftover, "set", "type", "managed"], log=log)
+                run(["ip", "link", "set", leftover, "up"], log=log)
+            cleared = True
+    if cleared and log:
+        log("Reset a leftover monitor-mode interface from a previous session.")
     if which("systemctl"):
         # A prior run that didn't restore may have left NetworkManager stopped —
         # revive it so the user never has to do it by hand.
@@ -248,17 +266,48 @@ def enable_monitor(iface: Interface, kill_networkmanager: bool = True,
     interface + mask wpa_supplicant) — it keeps a second WiFi uplink up but may
     capture nothing on adapters/drivers where NM still interferes.
     """
+    # Record which teardown path ran so a failure can be rolled back exactly.
+    # This is the crux of the "NetworkManager goes kaboot and never comes back"
+    # bug: both paths tear networking DOWN *before* the fallible `airmon-ng start`,
+    # so if that step fails (common when the rtl8xxxu adapter resets off the USB
+    # bus) we must undo the teardown before returning, or the box is left offline.
+    surgical = False
+    killed_nm = False
     if kill_networkmanager or which("nmcli") is None:
         run(["airmon-ng", "check", "kill"], log=log)
+        killed_nm = True
     else:
         # Surgical: make NetworkManager permanently ignore only this interface
         # (drop-in config + reload, which NM honors more fully than the runtime
         # `managed no`), then mask wpa_supplicant so it can't respawn. Keeps other
         # links up; on some drivers NM may still interfere and capture 0.
+        surgical = True
         _set_nm_unmanaged(iface.name, True, log=log)
         run(["nmcli", "device", "set", iface.name, "managed", "no"], log=log)
         run(["systemctl", "mask", "--now", "wpa_supplicant"], log=log)
         run(["pkill", "-x", "wpa_supplicant"], log=log)
+
+    def _rollback() -> None:
+        """Undo the teardown above so a failed enable never strands the machine
+        with NetworkManager dead / wpa_supplicant masked. Path-aware: check-kill
+        only STOPPED the services, the surgical path also MASKED wpa_supplicant
+        and wrote the unmanage drop-in."""
+        if surgical:
+            run(["systemctl", "unmask", "wpa_supplicant"], log=log)
+            run(["systemctl", "start", "wpa_supplicant"], log=log)
+            _set_nm_unmanaged(iface.name, False, log=log)   # remove drop-in + reload
+            if which("nmcli"):
+                run(["nmcli", "device", "set", iface.name, "managed", "yes"], log=log)
+        elif killed_nm:
+            run(["systemctl", "unmask", "wpa_supplicant"], log=log)  # harmless if not masked
+            if which("nmcli"):
+                run(["nmcli", "radio", "wifi", "on"], log=log)
+            r = run(["systemctl", "restart", "NetworkManager"], log=log)
+            if not r.ok:
+                run(["service", "network-manager", "restart"], log=log)
+        if log:
+            log("Monitor-enable failed — restored NetworkManager / wpa_supplicant so "
+                "you are not left offline.")
 
     run(["airmon-ng", "start", iface.name], timeout=30, log=log)
     mon = _monitor_iface_now(prefer_phy=iface.phy)
@@ -274,6 +323,7 @@ def enable_monitor(iface: Interface, kill_networkmanager: bool = True,
             log(f"'{iface.name}' is gone — the adapter reset/disconnected (common with VM USB "
                 "passthrough when switching to monitor mode). Replug it, then click Refresh. "
                 "The realtek-rtl8188eus-dkms driver + a USB 2.0 VM controller are far more stable.")
+        _rollback()
         return None
 
     # Fallback: manual switch on the original interface name.
@@ -283,43 +333,60 @@ def enable_monitor(iface: Interface, kill_networkmanager: bool = True,
     run(["iw", "dev", iface.name, "set", "type", "monitor"], log=log)
     run(["ip", "link", "set", iface.name, "up"], log=log)
     mon = _monitor_iface_now(prefer_phy=iface.phy)
-    if mon and log:
-        log(f"Monitor mode enabled (manual): {mon}")
-    elif log:
+    if mon:
+        if log:
+            log(f"Monitor mode enabled (manual): {mon}")
+        return mon
+    if log:
         log("Failed to enable monitor mode. If the adapter keeps dropping, it's the USB "
             "passthrough resetting it — see the driver/USB notes.")
-    return mon
+    _rollback()
+    return None
 
 
-def disable_monitor(mon_iface: str, restore_services: bool = True, log: Optional[LogFn] = None) -> None:
+def disable_monitor(mon_iface: str, restore_services: bool = True,
+                    log: Optional[LogFn] = None) -> bool:
     """Take the card out of monitor mode and hand the interface back.
 
-    Mirror of enable_monitor: with nmcli we just re-manage this one interface
-    (the surgical path never touched anything else, so we must NOT restart
-    NetworkManager and bounce other links). Only without nmcli do we restart the
-    services that the blunt `airmon-ng check kill` fallback would have stopped.
+    Returns True only if the recovery actually succeeded (monitor teardown, if the
+    adapter is still present, AND the NetworkManager restart), so the GUI can tell
+    the user honestly whether networking is back rather than assuming it worked.
+
+    Undoes whatever either enable path did: unmask wpa_supplicant, drop the
+    surgical unmanage drop-in, turn the wifi radio back on, restart NetworkManager
+    (the default `check kill` path stopped it — restarting restores WiFi and
+    re-adopts the still-up wired link), and re-manage the interface.
     """
-    run(["airmon-ng", "stop", mon_iface], timeout=30, log=log)
+    # If the adapter reset off the bus, `mon_iface` names a device that no longer
+    # exists. Running airmon-ng/nmcli against a gone device only spews scary
+    # `rc!=0 Device not found` lines into the Activity log (the "error" the user
+    # sees on Restore) — skip those, but STILL restart NetworkManager to recover.
+    present = os.path.exists(f"/sys/class/net/{mon_iface}")
+    stop_ok = True
+    if present:
+        stop_ok = run(["airmon-ng", "stop", mon_iface], timeout=30, log=log).ok
+    elif log:
+        log(f"'{mon_iface}' is no longer present (adapter reset/unplugged); skipping "
+            "airmon-ng stop and restarting NetworkManager to recover networking.")
     if not restore_services:
-        return
-    # Undo whatever either enable path did, in any order: unmask wpa_supplicant,
-    # turn the wifi radio back on, restart NetworkManager (the default path
-    # stopped it — restarting restores WiFi and re-adopts the still-up wired
-    # link), and re-manage the interface.
+        return stop_ok
     run(["systemctl", "unmask", "wpa_supplicant"], log=log)
-    # Drop the surgical unmanage drop-in if the surgical path wrote one, so the
-    # coming NetworkManager restart re-adopts this interface instead of ignoring it.
     base = mon_iface[:-3] if mon_iface.endswith("mon") else mon_iface
     _set_nm_unmanaged(base, False, log=log)
     if which("nmcli"):
         run(["nmcli", "radio", "wifi", "on"], log=log)
     r = run(["systemctl", "restart", "NetworkManager"], log=log)
-    if not r.ok:
-        run(["service", "network-manager", "restart"], log=log)
-    if which("nmcli"):
+    nm_ok = r.ok or run(["service", "network-manager", "restart"], log=log).ok
+    # Only re-manage the interface if it still exists, else nmcli's "Device not
+    # found" (rc!=0) surfaces as a spurious error even though NM is already back.
+    if which("nmcli") and os.path.exists(f"/sys/class/net/{base}"):
         run(["nmcli", "device", "set", base, "managed", "yes"], log=log)
+    ok = nm_ok and (stop_ok or not present)
     if log:
-        log("Monitor mode disabled; NetworkManager restarted, WiFi restored.")
+        log("Monitor mode disabled; NetworkManager restarted, WiFi restored." if ok
+            else "Restore INCOMPLETE: NetworkManager restart or monitor teardown failed — "
+                 "WiFi may still be down (see the rc lines above).")
+    return ok
 
 
 # --------------------------------------------------------------------- MAC

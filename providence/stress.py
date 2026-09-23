@@ -121,6 +121,16 @@ def run() -> int:
     r.check("flood parses bounded+fast", parse_csv, flood,
             invariant=lambda out: (len(out[0]) <= MAX_ROWS, f"{len(out[0])} APs > MAX_ROWS"))
 
+    print("== parse_csv: duplicate BSSID rows (GUI insert must not crash) ==")
+    dup_header = ("BSSID, First time seen, Last time seen, channel, Speed, Privacy, "
+                  "Cipher, Authentication, Power, # beacons, # IV, LAN IP, ID-length, ESSID, Key\n\n")
+    dup_row = "AA:BB:CC:11:22:33, t, t, 6, 195, WPA2, CCMP, PSK, -40, 100, 0, 0. 0. 0. 0, 4, dupnet, \n"
+    dup_csv = dup_header + dup_row * 5
+    # airodump can emit the same BSSID more than once in one CSV; the parser must
+    # not choke, and the GUI de-dupes on iid before inserting (see _refresh_ap_tree).
+    r.check("duplicate BSSID rows parse to a 2-tuple", parse_csv, dup_csv,
+            invariant=lambda out: (isinstance(out, tuple) and len(out) == 2, "not a 2-tuple"))
+
     print("== safe_prefix: path containment ==")
     base = os.path.abspath(os.sep + "base")
     for e in _hostile_essids():

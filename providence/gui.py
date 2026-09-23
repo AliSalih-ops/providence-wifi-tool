@@ -96,6 +96,10 @@ class App:
         self._timers: dict = {}            # named after() ids, so we never double-schedule
         self._log_fh = None                # on-disk activity log (opened lazily)
         self._scan_empty_polls = 0         # for the 0-networks self-diagnostic
+        self._radio_busy = False           # an enable/restore worker is in flight
+        self._nm_torn_down = False         # networking was torn down (NM/wpa killed);
+                                           # Restore/Quit must revive it even if monitor
+                                           # mode never actually came up
 
         self._build_style()
         self._build_widgets()
@@ -548,6 +552,12 @@ class App:
     def on_enable_monitor(self) -> None:
         if not self._guard():
             return
+        if self._radio_busy:
+            self.log("A monitor enable/restore is already in progress.")
+            return
+        if self.mon_iface:            # idempotency: don't re-enable on top of a live session
+            self.log(f"Monitor mode is already on ({self.mon_iface}).")
+            return
         iface = self._selected_interface()
         if not iface:
             messagebox.showinfo("Adapter", "Select a wireless interface first.")
@@ -557,7 +567,13 @@ class App:
                                        f"{iface.name} ({iface.driver}) does not report monitor support.\n"
                                        "Try anyway?"):
                 return
-        self.btn_mon.configure(state="disabled")
+        self._radio_busy = True
+        # Both real enable paths tear networking down (check kill, or mask
+        # wpa_supplicant + unmanage) BEFORE the fallible airmon-ng start. Record it
+        # now so that even if enable fails, Restore/Quit know to revive NM.
+        if not self.demo:
+            self._nm_torn_down = True
+        self._refresh_action_states()
 
         def work():
             if self.demo:
@@ -565,13 +581,22 @@ class App:
             return enable_monitor(iface, kill_networkmanager=not self.keep_nm_var.get(), log=self.log)
 
         def done(mon):
-            self.btn_mon.configure(state="normal")
+            self._radio_busy = False
             if mon:
                 self.mon_iface = mon
-                self._set_status()
+                self._set_status()          # also calls _refresh_action_states
                 self._update_mac_label()
             else:
-                messagebox.showerror("Monitor mode", "Could not enable monitor mode. See the log.")
+                # enable_monitor already rolled its own teardown back; networking
+                # should be up again. Clear the flag and tell the user plainly.
+                self._nm_torn_down = False
+                self._refresh_action_states()
+                messagebox.showerror(
+                    "Monitor mode",
+                    "Could not enable monitor mode — see the log.\n\n"
+                    "NetworkManager has been restored so you are not left offline. "
+                    "If the adapter vanished (common with VM USB passthrough), replug "
+                    "it and click Refresh before trying again.")
         self._run_async(work, done)
 
     def on_restore(self) -> None:
@@ -581,20 +606,38 @@ class App:
             self._set_status()
             self.log("[demo] networking restored")
             return
+        if self._radio_busy:
+            self.log("A monitor enable/restore is already in progress.")
+            return
         self._stop_all()
         mon = self.mon_iface
-        if not mon:
-            self.log("No monitor interface to restore.")
+        if not mon and not self._nm_torn_down:
+            self.log("Nothing to restore — networking was not touched.")
             return
+        self._radio_busy = True
+        self._refresh_action_states()
 
         def work():
-            disable_monitor(mon, log=self.log)
+            if mon:
+                return disable_monitor(mon, log=self.log)
+            # A failed enable killed NM but never produced a monitor interface;
+            # restore_supplicant revives NM / unmasks wpa_supplicant / clears any
+            # leftover drop-in or monitor iface.
+            restore_supplicant(self.log)
             return True
 
-        def done(_):
-            self.mon_iface = None
+        def done(ok):
+            self._radio_busy = False
+            if ok:
+                self.mon_iface = None
+                self._nm_torn_down = False
+                self._update_mac_label()
+            else:
+                messagebox.showerror(
+                    "Restore networking",
+                    "Restore did not fully succeed — WiFi may still be down. See the "
+                    "log. You can click Restore networking again, or reboot the VM.")
             self._set_status()
-            self._update_mac_label()
         self._run_async(work, done)
 
     def _set_status(self) -> None:
@@ -806,39 +849,49 @@ class App:
     def _poll_scan(self) -> None:
         if not self.scan:
             return
-        # airodump can die (bad iface, card yanked out of monitor); notice it,
-        # surface why, and reset the button instead of looping silently.
-        if not self.scan.running():
-            tail = self.scan.log_tail()
-            self._stop_scan("Scan process exited unexpectedly.")
-            if tail:
-                self.log("airodump said:\n" + tail)
-            return
-        aps, stations = self.scan.latest()
-        # Keep only the strongest MAX_APS so a flood of forged BSSIDs can't
-        # grow self.aps / the Treeview without bound.
-        self.aps = sorted(aps, key=lambda a: _pwr_key(a.power), reverse=True)[:MAX_APS]
-        self.stations = stations
-        self._refresh_ap_tree()
-        self._refresh_client_tree()   # keep client list + target label fresh
-        # Self-diagnose a persistent 0-networks: after a few empty polls, report
-        # the CSV state (exists? size? does it parse?) into the activity log.
-        if not self.aps:
-            self._scan_empty_polls += 1
-            if self._scan_empty_polls == 4:
-                self.log("Still 0 networks after 8s — CSV check: " + self.scan.diagnostic())
-        else:
-            self._scan_empty_polls = 0
-        self.scan_status.configure(text=f"scanning {self.band_var.get()} - {len(self.aps)} networks",
-                                   foreground=C["warn"])
-        self._schedule("scan", SCAN_POLL_MS, self._poll_scan)
+        try:
+            # airodump can die (bad iface, card yanked out of monitor); notice it,
+            # surface why, and reset the button instead of looping silently.
+            if not self.scan.running():
+                tail = self.scan.log_tail()
+                self._stop_scan("Scan process exited unexpectedly.")  # clears self.scan
+                if tail:
+                    self.log("airodump said:\n" + tail)
+                return
+            aps, stations = self.scan.latest()
+            # Keep only the strongest MAX_APS so a flood of forged BSSIDs can't
+            # grow self.aps / the Treeview without bound.
+            self.aps = sorted(aps, key=lambda a: _pwr_key(a.power), reverse=True)[:MAX_APS]
+            self.stations = stations
+            self._refresh_ap_tree()
+            self._refresh_client_tree()   # keep client list + target label fresh
+            # Self-diagnose a persistent 0-networks: after a few empty polls, report
+            # the CSV state (exists? size? does it parse?) into the activity log.
+            if not self.aps:
+                self._scan_empty_polls += 1
+                if self._scan_empty_polls == 4:
+                    self.log("Still 0 networks after 8s — CSV check: " + self.scan.diagnostic())
+            else:
+                self._scan_empty_polls = 0
+            self.scan_status.configure(text=f"scanning {self.band_var.get()} - {len(self.aps)} networks",
+                                       foreground=C["warn"])
+        except Exception as e:
+            # One bad row / Treeview hiccup must never kill the scan loop for good.
+            self.log(f"Scan refresh error (recovering): {e}")
+        finally:
+            # Re-arm unless the scan was intentionally stopped above (which sets
+            # self.scan=None and cancels the timer).
+            if self.scan:
+                self._schedule("scan", SCAN_POLL_MS, self._poll_scan)
 
     def _refresh_ap_tree(self) -> None:
         selected = self._selected_bssid()
         existing = set(self.ap_tree.get_children())
         seen = set()
         for a in self.aps:
-            seen.add(a.bssid)
+            if a.bssid in seen:      # duplicate BSSID this pass — keep the first
+                continue              # (strongest, since self.aps is sorted); a
+            seen.add(a.bssid)        # repeated iid would raise "item already exists"
             vals = (a.bssid, a.power, a.channel, a.beacons, a.privacy, a.cipher, a.auth, a.clients, a.essid)
             if a.bssid in existing:
                 self.ap_tree.item(a.bssid, values=vals)
@@ -1222,7 +1275,8 @@ class App:
     def _refresh_action_states(self) -> None:
         """Enable each control only when it can actually do something, so nothing
         is a live no-op and the radio is never asked to do two jobs at once."""
-        mon = bool(self.mon_iface)
+        busy = self._radio_busy            # an enable/restore worker is in flight
+        mon = bool(self.mon_iface) and not busy
         cap = self.capture is not None
         cap_run = cap and self.capture.running()
         pm = self.pmkid is not None
@@ -1233,6 +1287,11 @@ class App:
         def en(btn, cond):
             btn.configure(state="normal" if cond else "disabled")
 
+        # Radio-mode buttons: never let a second enable/restore start while one is
+        # running, never offer Enable when monitor is already up, and offer Restore
+        # whenever networking was torn down (even if monitor mode never came up).
+        en(self.btn_mon, not busy and not bool(self.mon_iface))
+        en(self.btn_restore, not busy and (bool(self.mon_iface) or self._nm_torn_down))
         en(self.btn_scan, mon and not cap_run and not pm_run)
         en(self.btn_inject, mon and idle)
         en(self.btn_cap, mon and idle)
@@ -1276,12 +1335,16 @@ class App:
 
     def on_close(self) -> None:
         self._stop_all()
-        # ALWAYS restore networking if we enabled monitor mode — leaving
-        # NetworkManager dead (forcing a manual revive) was the whole complaint.
-        # No prompt: quitting must never strand the machine offline.
-        if self.mon_iface and not self.demo:
+        # ALWAYS restore networking if we touched it — leaving NetworkManager dead
+        # (forcing a manual revive) was the whole complaint. No prompt: quitting
+        # must never strand the machine offline. Restore even when monitor mode
+        # never came up (a failed enable still tore networking down).
+        if not self.demo and (self.mon_iface or self._nm_torn_down):
             try:
-                disable_monitor(self.mon_iface, log=self.log)
+                if self.mon_iface:
+                    disable_monitor(self.mon_iface, log=self.log)
+                else:
+                    restore_supplicant(self.log)
             except Exception as e:
                 self.log(f"Restore on quit failed: {e}")
         if self._log_fh:
