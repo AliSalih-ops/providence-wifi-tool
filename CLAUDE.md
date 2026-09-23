@@ -46,12 +46,35 @@ tests on this box:
   only wpa_supplicant (NM respawns it); `nmcli managed no` / `radio wifi off`
   (NM still interferes).
 
-## Open bug to chase (why the VM install happened)
-It scans successfully **once**, but is **flaky on repeat**: after quitting and
-relaunching, "Start scan" sometimes returns 0 or won't scan, and NetworkManager
-can end up in a weird state. Likely a mix of (a) leftover state between runs
-(startup now un-masks wpa_supplicant + `nmcli radio wifi on` to mitigate) and
-(b) the rtl8xxxu/USB-passthrough adapter wedging on repeated monitor toggles.
+## The "kaboot cascade" bug — FIXED 2026-09-24 (commit 278b61c)
+Symptom was: enable monitor -> NetworkManager dies AND adapter not in monitor AND
+can't scan; Restore -> error; quit+relaunch+enable -> another error. A 34-agent
+audit (19 confirmed findings) traced it to one structural flaw: the teardown and
+the recovery gated on different things, so a failed enable orphaned NM with no
+way back. Fixes now in tree:
+- `enable_monitor` is **atomic** — records which teardown ran (check-kill vs
+  surgical) and rolls it back on every failure path, so a failed `airmon-ng
+  start` (adapter reset off USB) never leaves NM dead / wpa_supplicant masked.
+- `disable_monitor` skips airmon-ng/nmcli against a **vanished** adapter (no more
+  spurious "Device not found" error lines = the old "Restore error"), still
+  restarts NM, returns an honest success bool.
+- `restore_supplicant` startup self-heal now also **resets a leftover monitor
+  iface** back to managed, so the next enable starts clean.
+- GUI: `_nm_torn_down` flag (independent of `mon_iface`) lets Restore/Quit revive
+  NM even after an enable that produced no monitor iface; radio buttons gated in
+  `_refresh_action_states` (no overlapping workers); `_poll_scan` try/except so a
+  bad Treeview insert can't kill scanning; `_refresh_ap_tree` de-dupes BSSIDs.
+Verified: 132 selftest + 93 stress on Windows & Linux; full demo GUI flow under
+real Tk. **Still needs one live check on the VM** (only the radio can prove it).
+
+## Open decision — surgical vs check-kill default
+The owner's stated intended behavior is the SURGICAL path (wlan0 leaves NM, NM
+stays alive). It is currently the **opt-in** checkbox; the DEFAULT is still
+check-kill because on this rtl8xxxu adapter NM-alive empirically gave 0 networks.
+The surgical path now uses the more-thorough drop-in unmanage + has rollback, so
+it may finally capture with NM alive. **Action:** tick "keep other Wi-Fi up" on
+the VM and scan — if it shows networks, make surgical the default; if still 0,
+it's driver interference and check-kill stays the default.
 
 **To debug live:** reproduce a failed second scan, then check the exact state —
 `iw dev` (is `wlan0` `type monitor`?), `systemctl status NetworkManager`,
