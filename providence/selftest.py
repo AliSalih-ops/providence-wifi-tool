@@ -32,7 +32,8 @@ from .demo import (
     DemoScanSession,
     demo_interfaces,
 )
-from .iface import _parse_iw_dev, _parse_new_mac, _supported_bands, _supported_modes, macchanger_argv
+from .iface import (_parse_iw_dev, _parse_new_mac, _supported_bands, _supported_modes,
+                    _valid_iface_name, macchanger_argv)
 from .scan import AccessPoint, airodump_band, parse_csv, scan_argv
 from .util import is_mac
 
@@ -236,6 +237,16 @@ def run() -> int:
     c.ok("reject empty", not is_mac(""))
     c.ok("reject spaces", not is_mac("aa bb cc dd ee ff"))
     c.ok("reject trailing junk", not is_mac("aa:bb:cc:dd:ee:ff;rm"))
+
+    print("== iface-name validation (NM drop-in write guard) ==")
+    c.ok("valid wlan0", _valid_iface_name("wlan0"))
+    c.ok("valid wlan0mon", _valid_iface_name("wlan0mon"))
+    c.ok("valid predictable name", _valid_iface_name("wlp3s0"))
+    c.ok("reject empty iface", not _valid_iface_name(""))
+    c.ok("reject newline injection", not _valid_iface_name("wlan0\nunmanaged-devices=*"))
+    c.ok("reject space", not _valid_iface_name("wlan 0"))
+    c.ok("reject slash", not _valid_iface_name("../etc"))
+    c.ok("reject over-long (>15)", not _valid_iface_name("x" * 16))
 
     print("== PMKID scoping ==")
     line = "WPA*01*deadbeefdeadbeefdeadbeefdeadbeef*aabbcc112233*445566778899*4d794e6574***"

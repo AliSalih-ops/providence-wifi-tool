@@ -149,8 +149,22 @@ def list_interfaces(log: Optional[LogFn] = None) -> List[Interface]:
 
 def restore_supplicant(log: Optional[LogFn] = None) -> None:
     """Clean up leftover monitor-session state at startup so a previous run (or
-    manual testing) can't leave WiFi broken: un-mask wpa_supplicant if it was
-    left masked, and turn the WiFi radio back on."""
+    manual testing) can't leave WiFi broken: drop a stale surgical unmanage
+    config, un-mask wpa_supplicant if it was left masked, and turn the WiFi radio
+    back on."""
+    # A crashed surgical-mode session can leave the "ignore this interface" drop-in
+    # behind, which would keep the card unmanaged forever. Clear it first so the
+    # rest of this restore (and any NM restart below) re-adopts the interface.
+    if os.path.exists(_NM_UNMANAGE_CONF):
+        try:
+            os.remove(_NM_UNMANAGE_CONF)
+            if log:
+                log("Removed a leftover NetworkManager unmanage config from a previous session.")
+        except OSError as e:
+            if log:
+                log(f"Could not remove leftover NM unmanage config: {e}")
+        if which("nmcli"):
+            run(["nmcli", "general", "reload"], log=None)
     if which("systemctl"):
         # A prior run that didn't restore may have left NetworkManager stopped —
         # revive it so the user never has to do it by hand.
@@ -188,6 +202,37 @@ def _warn_weak_driver(driver: str, log: LogFn) -> None:
             f"'{driver}', then replug the adapter.")
 
 
+_NM_UNMANAGE_CONF = "/etc/NetworkManager/conf.d/99-pr0v1dence-unmanaged.conf"
+_IFACE_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,15}$")
+
+
+def _valid_iface_name(iface: str) -> bool:
+    """True if `iface` is a plausible Linux netdev name (Linux caps names at 15
+    bytes). Guards the drop-in write below so a hostile interface string can't
+    inject newlines/extra keys into NetworkManager's config file."""
+    return bool(iface) and bool(_IFACE_NAME_RE.match(iface))
+
+
+def _set_nm_unmanaged(iface: str, unmanaged: bool, log: Optional[LogFn] = None) -> None:
+    """Add/remove a NetworkManager drop-in that makes it permanently ignore
+    `iface`, then reload NM. This is more thorough than the runtime
+    `nmcli device set … managed no` (which NM doesn't always fully honor)."""
+    if not _valid_iface_name(iface):
+        return
+    try:
+        if unmanaged:
+            with open(_NM_UNMANAGE_CONF, "w") as f:
+                f.write(f"[keyfile]\nunmanaged-devices=interface-name:{iface}\n")
+        elif os.path.exists(_NM_UNMANAGE_CONF):
+            os.remove(_NM_UNMANAGE_CONF)
+    except OSError as e:
+        if log:
+            log(f"NM unmanage config update failed: {e}")
+        return
+    if which("nmcli"):
+        run(["nmcli", "general", "reload"], log=log)
+
+
 def enable_monitor(iface: Interface, kill_networkmanager: bool = True,
                    log: Optional[LogFn] = None) -> Optional[str]:
     """Put `iface` into monitor mode. Returns the monitor interface name.
@@ -206,8 +251,11 @@ def enable_monitor(iface: Interface, kill_networkmanager: bool = True,
     if kill_networkmanager or which("nmcli") is None:
         run(["airmon-ng", "check", "kill"], log=log)
     else:
-        # Surgical: unmanage only this interface and mask wpa_supplicant so it
-        # can't respawn. Keeps other links up, but NM itself may still interfere.
+        # Surgical: make NetworkManager permanently ignore only this interface
+        # (drop-in config + reload, which NM honors more fully than the runtime
+        # `managed no`), then mask wpa_supplicant so it can't respawn. Keeps other
+        # links up; on some drivers NM may still interfere and capture 0.
+        _set_nm_unmanaged(iface.name, True, log=log)
         run(["nmcli", "device", "set", iface.name, "managed", "no"], log=log)
         run(["systemctl", "mask", "--now", "wpa_supplicant"], log=log)
         run(["pkill", "-x", "wpa_supplicant"], log=log)
@@ -259,13 +307,16 @@ def disable_monitor(mon_iface: str, restore_services: bool = True, log: Optional
     # stopped it — restarting restores WiFi and re-adopts the still-up wired
     # link), and re-manage the interface.
     run(["systemctl", "unmask", "wpa_supplicant"], log=log)
+    # Drop the surgical unmanage drop-in if the surgical path wrote one, so the
+    # coming NetworkManager restart re-adopts this interface instead of ignoring it.
+    base = mon_iface[:-3] if mon_iface.endswith("mon") else mon_iface
+    _set_nm_unmanaged(base, False, log=log)
     if which("nmcli"):
         run(["nmcli", "radio", "wifi", "on"], log=log)
     r = run(["systemctl", "restart", "NetworkManager"], log=log)
     if not r.ok:
         run(["service", "network-manager", "restart"], log=log)
     if which("nmcli"):
-        base = mon_iface[:-3] if mon_iface.endswith("mon") else mon_iface
         run(["nmcli", "device", "set", base, "managed", "yes"], log=log)
     if log:
         log("Monitor mode disabled; NetworkManager restarted, WiFi restored.")
