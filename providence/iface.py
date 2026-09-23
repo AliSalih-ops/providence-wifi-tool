@@ -152,6 +152,12 @@ def restore_supplicant(log: Optional[LogFn] = None) -> None:
     manual testing) can't leave WiFi broken: un-mask wpa_supplicant if it was
     left masked, and turn the WiFi radio back on."""
     if which("systemctl"):
+        # A prior run that didn't restore may have left NetworkManager stopped —
+        # revive it so the user never has to do it by hand.
+        if run(["systemctl", "is-active", "NetworkManager"]).out.strip() != "active":
+            run(["systemctl", "start", "NetworkManager"], log=log)
+            if log:
+                log("Restarted NetworkManager (a previous session had left it stopped).")
         if "masked" in run(["systemctl", "is-enabled", "wpa_supplicant"]).text().lower():
             run(["systemctl", "unmask", "wpa_supplicant"], log=log)
             run(["systemctl", "start", "wpa_supplicant"], log=log)

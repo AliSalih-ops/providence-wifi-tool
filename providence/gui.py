@@ -1276,12 +1276,14 @@ class App:
 
     def on_close(self) -> None:
         self._stop_all()
+        # ALWAYS restore networking if we enabled monitor mode — leaving
+        # NetworkManager dead (forcing a manual revive) was the whole complaint.
+        # No prompt: quitting must never strand the machine offline.
         if self.mon_iface and not self.demo:
-            if messagebox.askyesno("Quit", "Restore networking (disable monitor mode) before quitting?"):
-                try:
-                    disable_monitor(self.mon_iface, log=self.log)
-                except Exception as e:
-                    self.log(f"Restore on quit failed: {e}")
+            try:
+                disable_monitor(self.mon_iface, log=self.log)
+            except Exception as e:
+                self.log(f"Restore on quit failed: {e}")
         if self._log_fh:
             try:
                 self._log_fh.close()
